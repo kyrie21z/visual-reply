@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-STORE_VERSION = 4
+STORE_VERSION = 5
 
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 EXT_FORMAT = {".json": "json", ".html": "html", ".md": "md"}
@@ -448,6 +448,32 @@ def read_session(cache_dir: Path | str, session_id: str) -> dict | None:
     return data if isinstance(data, dict) and data.get("id") else None
 
 
+def _iso_epoch(value: str) -> float:
+    """把 ISO-8601 时间戳转成 epoch 秒；无法解析时返回 0.0。"""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _session_sort_key(s: dict) -> tuple:
+    """固定创建顺序：置顶优先，其次创建时间，再用 created_seq / id 稳定破平。
+
+    绝不使用 updated_at 或 seq：会话收到新回复时位置保持不变。
+    """
+    return (
+        1 if s.get("pinned") else 0,
+        _iso_epoch(str(s.get("created_at") or s.get("updated_at") or "")),
+        int(s.get("created_seq") or 0),
+        str(s.get("id") or ""),
+    )
+
+
 def list_sessions(cache_dir: Path | str) -> list[dict]:
     root = sessions_root(cache_dir)
     items: list[dict] = []
@@ -463,7 +489,7 @@ def list_sessions(cache_dir: Path | str) -> list[dict]:
         data = read_json(entry / "session.json", None)
         if isinstance(data, dict) and data.get("id"):
             items.append(data)
-    items.sort(key=lambda s: (1 if s.get("pinned") else 0, int(s.get("seq") or 0)), reverse=True)
+    items.sort(key=_session_sort_key, reverse=True)
     return items
 
 
@@ -700,6 +726,17 @@ def commit_reply(cache_dir: Path | str,
     if not isinstance(previous, dict):
         previous = {}
 
+    # created_seq 是会话创建顺序的不可变锚点：老会话收到新回复时保持不变。
+    raw_created_seq = previous.get("created_seq")
+    if (isinstance(raw_created_seq, int) and not isinstance(raw_created_seq, bool)
+            and raw_created_seq > 0):
+        created_seq = raw_created_seq
+    elif previous.get("created_at"):
+        # v5 之前的会话没有 created_seq，固定为 0，避免新回复把旧会话顶到前面。
+        created_seq = 0
+    else:
+        created_seq = seq
+
     label = session.get("label") or ""
     custom_label = bool(session.get("custom_label"))
     if not (custom_label and label):
@@ -724,6 +761,7 @@ def commit_reply(cache_dir: Path | str,
         "last_format": fmt,
         "reply_count": int(previous.get("reply_count") or 0) + 1,
         "created_at": previous.get("created_at") or now,
+        "created_seq": created_seq,
         "updated_at": now,
     }
     atomic_write_json(sdir / "session.json", record)
