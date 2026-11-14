@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Test / tooling caches
+.pytest_cache/
+.venv/
+venv/
+
+# Logs
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
