@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""visual-reply 本地预览服务 v2（纯标准库）。
+"""visual-reply 本地预览服务 v4（纯标准库，多会话工作台）。
 
 三种渲染模式：
     md     兼容模式：阅读 / 脑图 / 分屏
@@ -7,13 +7,22 @@
     html   HTML Artifact 沙箱：iframe 渲染 + 源码查看
 
 接口：
-    GET /                              单页 HTML
-    GET /api/latest                    最新内容 {version, format, title, content, mtime, updated_at}
-    GET /api/history                   最近 20 条历史
-    GET /api/history/<file>            单条历史
-    GET /artifact/latest               HTML 原文（供 iframe 加载）
-    GET /artifact/history/<file>       历史 HTML 原文
-    GET /healthz                       健康检查（含 version）
+    GET  /                                  单页 HTML（多会话工作台）
+    GET  /api/latest                        最新内容 {version, format, title, content, mtime, updated_at}
+    GET  /api/history                       最近 20 条历史（v3 投影）
+    GET  /api/history/<file>                单条历史
+    GET  /api/sessions                      会话列表（置顶优先，seq 倒序）
+    GET  /api/sessions/<sid>/replies        某会话的回复轮次（最新在前）
+    GET  /api/sessions/<sid>/replies/<rid>  单条回复（含正文）
+    GET  /api/feed?limit=50                 跨会话全局时间线
+    GET  /api/state?since=<seq>             增量补播事件
+    GET  /api/events                        SSE 实时推送
+    POST /api/notify                        唤醒 SSE（发布后立即刷新）
+    POST /api/sessions/<sid>                更新 label / pinned
+    GET  /artifact/latest                   HTML 原文（供 iframe 加载）
+    GET  /artifact/history/<file>           历史 HTML 原文
+    GET  /artifact/session/<sid>/<rid>      会话回复的 HTML 原文
+    GET  /healthz                           健康检查（含 version）
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import signal
 import sys
@@ -29,13 +39,23 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import vr_store  # noqa: E402  - 保证按路径加载时也能 import
 
 DEFAULT_PORT = 18765
 DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
-VERSION = 3
+VERSION = 4
 HISTORY_LIMIT = 20
+REPLY_LIMIT = 200
+FEED_LIMIT = 50
+SSE_CLIENTS = 32
+SSE_QUEUE = 64
+SSE_POLL = 0.35
+SSE_KEEPALIVE = 20.0
 
 FORMAT_EXT = {"md": ".md", "json": ".json", "html": ".html"}
 EXT_FORMAT = {".md": "md", ".json": "json", ".html": "html"}
@@ -400,13 +420,116 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 @media (max-width: 900px) {
   .doc { order: 10; flex-basis: 100%; max-width: 100%; }
   .markdown-body { padding: 22px 20px 100px; font-size: 15px; }
-  body.view-split #stage { flex-direction: column; }
-  body.view-split #mindmap-pane { flex: 0 0 45%; border-left: 0; border-top: 1px solid var(--border); }
+  .pane-set.view-split .pane-frame { flex-direction: column; }
+  .pane-set.view-split .pane[data-pane-role="mindmap"] { flex: 0 0 45%; border-left: 0; border-top: 1px solid var(--border); }
   #history-select { max-width: 170px; }
   #canvas-root { padding: 20px 16px 120px; }
   .bento { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .bento-card { grid-column: span 1; }
   body.drawer-open #stage { margin-right: 0; }
+}
+/* ---------- v4 Workbench：会话栏 / 分屏 / 阅读守卫 ---------- */
+#shell { flex: 1 1 auto; display: flex; min-height: 0; min-width: 0; }
+#session-rail {
+  flex: 0 0 272px; display: flex; flex-direction: column; min-height: 0;
+  background: var(--bg-elev); border-right: 1px solid var(--border);
+  transition: flex-basis .18s ease;
+}
+#session-rail[data-open="false"] { flex-basis: 0; overflow: hidden; border-right: 0; }
+.rail-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 9px 10px 9px 12px; border-bottom: 1px solid var(--border);
+}
+.rail-title { font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; color: var(--fg-muted); }
+.rail-tabs { display: flex; gap: 2px; padding: 2px; background: var(--bg-soft); border: 1px solid var(--border-strong); border-radius: 9px; }
+.rail-tabs button { border: 0; background: transparent; color: var(--fg-muted); padding: 3px 7px; font-size: 11px; border-radius: 7px; }
+.rail-tabs button[data-active="true"] { background: var(--bg-elev); color: var(--fg); box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
+.rail-list { flex: 1 1 auto; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.rail-empty { padding: 26px 12px; text-align: center; font-size: 12px; color: var(--fg-muted); line-height: 1.6; }
+.rail-card {
+  position: relative; display: flex; gap: 8px; padding: 8px 9px 8px 12px;
+  border: 1px solid var(--border); border-radius: 11px; background: var(--bg-soft);
+  cursor: pointer; transition: border-color .15s, background .15s;
+}
+.rail-card:hover { border-color: var(--accent); }
+.rail-card[data-active="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.rail-accent { position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px; border-radius: 0 3px 3px 0; }
+.rail-main { min-width: 0; flex: 1 1 auto; padding-right: 26px; }
+.rail-top { display: flex; align-items: center; gap: 6px; }
+.rail-label { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rail-client {
+  flex: 0 0 auto; font-size: 9.5px; font-weight: 650; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--fg-muted); border: 1px solid var(--border-strong);
+  border-radius: 999px; padding: 0 6px;
+}
+.rail-sub { margin-top: 3px; font-size: 11.5px; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rail-meta { margin-top: 3px; font-size: 10.5px; color: var(--fg-muted); opacity: .85; }
+.rail-unread {
+  position: absolute; top: 7px; right: 8px; min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px; background: var(--err); color: #fff; font-size: 10px; font-weight: 650;
+  line-height: 16px; text-align: center;
+}
+.rail-actions { position: absolute; right: 6px; bottom: 5px; display: none; gap: 2px; }
+.rail-card:hover .rail-actions { display: flex; }
+.rail-actions button { padding: 1px 6px; font-size: 10.5px; line-height: 1.5; border-radius: 6px; background: var(--bg-elev); }
+.rail-foot { padding: 8px 10px; border-top: 1px solid var(--border); }
+.rail-foot button { width: 100%; }
+.feed-item {
+  display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--bg-soft); cursor: pointer;
+}
+.feed-item:hover { border-color: var(--accent); }
+.feed-seq { flex: 0 0 auto; font-size: 10.5px; font-variant-numeric: tabular-nums; color: var(--fg-muted); padding-top: 1px; }
+.feed-main { min-width: 0; flex: 1 1 auto; }
+.feed-title { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.feed-sub { margin-top: 2px; font-size: 10.5px; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#new-reply-banner {
+  display: flex; align-items: center; gap: 10px; padding: 7px 16px;
+  background: var(--accent-soft); border-bottom: 1px solid var(--border); font-size: 12.5px; z-index: 9;
+}
+#new-reply-banner .spacer { flex: 1 1 auto; }
+#new-reply-banner button { padding: 3px 10px; border-radius: 7px; }
+#toast .toast-action { margin-left: 9px; padding: 2px 9px; border-radius: 6px; border-color: var(--accent); color: var(--accent); }
+#stage { min-width: 0; }
+#stage[data-split="h"] #pane-primary { flex: 1 1 50%; }
+#stage[data-split="h"] #pane-secondary { flex: 1 1 50%; border-left: 1px solid var(--border-strong); }
+#stage[data-split="v"] { flex-direction: column; }
+#stage[data-split="v"] #pane-primary { flex: 1 1 50%; }
+#stage[data-split="v"] #pane-secondary { flex: 1 1 50%; border-top: 1px solid var(--border-strong); }
+.pane-set { display: flex; flex-direction: column; min-width: 0; min-height: 0; flex: 1 1 100%; }
+.pane-frame { flex: 1 1 auto; display: flex; min-height: 0; min-width: 0; }
+.pane-bar { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid var(--border); background: var(--bg-elev); }
+.pane-bar .doc { max-width: 42%; }
+.pane-bar select { max-width: 190px; }
+.pane-set .pane[data-pane-role="reading"] { flex: 1 1 auto; overflow: auto; }
+.pane-set .pane[data-pane-role="mindmap"] { flex: 0 0 46%; overflow: hidden; border-left: 1px solid var(--border); background: var(--bg); }
+.pane-set .pane[data-pane-role="canvas"] { flex: 1 1 auto; overflow: auto; display: none; }
+.pane-set .pane[data-pane-role="artifact"] { flex: 1 1 auto; display: none; flex-direction: column; min-height: 0; }
+.pane-set.mode-canvas .pane[data-pane-role="canvas"] { display: block; }
+.pane-set.mode-html .pane[data-pane-role="artifact"] { display: flex; }
+.pane-set.view-reading .pane[data-pane-role="mindmap"] { display: none; }
+.pane-set.view-mindmap .pane[data-pane-role="reading"] { display: none; }
+.pane-set.view-mindmap .pane[data-pane-role="mindmap"] { flex: 1 1 auto; border-left: 0; }
+.pane-set.mode-canvas .pane[data-pane-role="reading"],
+.pane-set.mode-canvas .pane[data-pane-role="mindmap"],
+.pane-set.mode-html .pane[data-pane-role="reading"],
+.pane-set.mode-html .pane[data-pane-role="mindmap"],
+.pane-set.mode-html .pane[data-pane-role="canvas"] { display: none !important; }
+.pane-canvas-root { max-width: 1200px; margin: 0 auto; padding: 30px 30px 120px; }
+.pane-artifact-frame { flex: 1 1 auto; width: 100%; border: 0; background: #ffffff; }
+.pane-artifact-source {
+  flex: 1 1 auto; margin: 0; padding: 22px 26px; overflow: auto; white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px; line-height: 1.6; color: var(--fg); background: var(--bg);
+}
+.pane-mindmap-svg { display: block; width: 100%; height: 100%; }
+#pane-secondary .markdown-body { padding: 24px 30px 120px; }
+@media (max-width: 900px) {
+  #session-rail { flex-basis: 210px; }
+  .pane-bar .doc { display: none; }
+  #stage[data-split="h"] { flex-direction: column; }
+  #stage[data-split="h"] #pane-secondary { border-left: 0; border-top: 1px solid var(--border-strong); }
+  .pane-canvas-root { padding: 20px 16px 110px; }
 }
 </style>
 </head>
@@ -418,6 +541,8 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     <div id="doc-sub" class="doc-sub"></div>
   </div>
   <div class="spacer"></div>
+  <button type="button" id="rail-toggle" title="显示 / 隐藏会话栏">会话</button>
+  <button type="button" id="mode-btn" title="锁定当前会话，或跟随全局最新">跟随全局</button>
   <div class="seg" id="view-switch" role="group" aria-label="视图切换">
     <button type="button" data-view="reading">阅读</button>
     <button type="button" data-view="mindmap">脑图</button>
@@ -428,23 +553,84 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   <button type="button" id="theme-btn">主题：浅色</button>
   <span id="status" class="status" data-state="online"><i></i><span>连接中</span></span>
 </header>
-<main id="stage">
-  <section id="reading-pane" class="pane">
-    <article id="content" class="markdown-body" hidden></article>
-    <div id="empty" class="empty">还没有内容。让 Agent 发布一条回复即可在此看到。</div>
-  </section>
-  <section id="mindmap-pane" class="pane">
-    <svg id="mindmap-svg"></svg>
-    <div id="mindmap-empty" class="empty" hidden>脑图库未加载</div>
-  </section>
-  <section id="canvas-pane" class="pane">
-    <div id="canvas-root"></div>
-  </section>
-  <section id="artifact-pane" class="pane" data-sub="full">
-    <iframe id="artifact-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="HTML Artifact"></iframe>
-    <pre id="artifact-source" hidden></pre>
-  </section>
-</main>
+<div id="new-reply-banner" hidden>
+  <span id="new-reply-banner-text">本会话有新回复</span>
+  <span class="spacer"></span>
+  <button type="button" id="new-reply-jump">切到最新</button>
+  <button type="button" id="new-reply-dismiss">忽略</button>
+</div>
+<div id="shell">
+  <aside id="session-rail" data-open="true" aria-label="会话列表">
+    <div class="rail-head">
+      <span class="rail-title" id="rail-title">会话</span>
+      <div class="rail-tabs" id="rail-tabs" role="group" aria-label="会话筛选">
+        <button type="button" data-filter="all" data-active="true">全部</button>
+        <button type="button" data-filter="unread">未读</button>
+        <button type="button" data-filter="pinned">置顶</button>
+      </div>
+    </div>
+    <div class="rail-list" id="rail-list"></div>
+    <div class="rail-list" id="feed-list" hidden></div>
+    <div class="rail-foot">
+      <button type="button" id="feed-btn">全局时间线</button>
+    </div>
+  </aside>
+  <main id="stage">
+    <section id="pane-primary" class="pane-set mode-md view-reading" data-pane="primary">
+      <div class="pane-frame">
+        <section id="reading-pane" class="pane" data-pane-role="reading">
+          <article id="content" class="markdown-body pane-content" hidden></article>
+          <div id="empty" class="empty pane-empty">还没有内容。让 Agent 发布一条回复即可在此看到。</div>
+        </section>
+        <section id="mindmap-pane" class="pane" data-pane-role="mindmap">
+          <svg id="mindmap-svg" class="pane-mindmap-svg"></svg>
+          <div id="mindmap-empty" class="empty pane-mindmap-empty" hidden>脑图库未加载</div>
+        </section>
+        <section id="canvas-pane" class="pane" data-pane-role="canvas">
+          <div id="canvas-root" class="pane-canvas-root"></div>
+        </section>
+        <section id="artifact-pane" class="pane" data-pane-role="artifact" data-sub="full">
+          <iframe id="artifact-frame" class="pane-artifact-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="HTML Artifact"></iframe>
+          <pre id="artifact-source" class="pane-artifact-source" hidden></pre>
+        </section>
+      </div>
+    </section>
+    <section id="pane-secondary" class="pane-set mode-md view-reading" data-pane="secondary" hidden>
+      <div class="pane-bar">
+        <div class="doc">
+          <div class="pane-doc-title doc-title">分屏会话</div>
+          <div class="pane-doc-sub doc-sub"></div>
+        </div>
+        <div class="spacer"></div>
+        <div class="seg view-switch" role="group" aria-label="分屏视图切换">
+          <button type="button" data-view="reading">阅读</button>
+          <button type="button" data-view="mindmap">脑图</button>
+          <button type="button" data-view="split">分屏</button>
+        </div>
+        <select class="sec-reply-select" aria-label="分屏回复轮次"><option value="">最新</option></select>
+        <select class="sec-session-select" aria-label="分屏会话"></select>
+        <button type="button" class="sec-close" title="关闭分屏">关闭分屏</button>
+      </div>
+      <div class="pane-frame">
+        <section class="pane" data-pane-role="reading">
+          <article class="markdown-body pane-content" hidden></article>
+          <div class="empty pane-empty">分屏会话还没有内容。</div>
+        </section>
+        <section class="pane" data-pane-role="mindmap">
+          <svg class="pane-mindmap-svg"></svg>
+          <div class="empty pane-mindmap-empty" hidden>脑图库未加载</div>
+        </section>
+        <section class="pane" data-pane-role="canvas">
+          <div class="pane-canvas-root"></div>
+        </section>
+        <section class="pane" data-pane-role="artifact" data-sub="full">
+          <iframe class="pane-artifact-frame" sandbox="allow-scripts" referrerpolicy="no-referrer" title="HTML Artifact"></iframe>
+          <pre class="pane-artifact-source" hidden></pre>
+        </section>
+      </div>
+    </section>
+  </main>
+</div>
 <aside id="drawer" aria-hidden="true" aria-label="详情抽屉">
   <div class="drawer-head">
     <div class="drawer-head-main">
@@ -483,30 +669,31 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     html: [{ id: 'full', label: '全屏' }, { id: 'source', label: '源码' }]
   };
 
-  var state = {
-    mode: 'md',
-    subview: 'reading',
+  var app = {
     theme: localStorage.getItem('vr.theme') || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'),
-    content: '',
-    format: 'md',
-    title: '',
-    latestMtime: 0,
-    latestLoaded: false,
-    viewingHistory: false,
-    currentFile: null,
-    canvasData: null,
-    drawer: {},
-    drawerSeq: 0,
-    artifactSrc: '',
-    mm: null,
-    seq: 0,
+    mode: 'global',
+    layout: 'h',
+    railView: 'sessions',
+    filter: 'all',
+    sessions: [],
+    replies: {},
+    globalSeq: 0,
+    lastHandledSeq: 0,
+    latestSessionId: '',
+    latestReplyId: '',
+    lastSeen: {},
+    pendingBanner: null,
+    sse: null,
     polling: false
   };
+  try {
+    app.lastSeen = JSON.parse(localStorage.getItem('vr.lastSeen') || '{}') || {};
+  } catch (err) {
+    app.lastSeen = {};
+  }
 
-  var article = $('#content');
-  var emptyBox = $('#empty');
-  var canvasRoot = $('#canvas-root');
   var drawer = $('#drawer');
+  var mmdSeq = 0;
 
   /* ---------- 基础工具 ---------- */
 
@@ -541,10 +728,36 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 
   function toast(message) {
     var box = $('#toast');
-    box.textContent = message;
+    box.innerHTML = '';
+    var span = document.createElement('span');
+    span.textContent = message;
+    box.appendChild(span);
     box.hidden = false;
     clearTimeout(toast._t);
     toast._t = setTimeout(function () { box.hidden = true; }, 2600);
+  }
+
+  /* 跨会话新回复：带一个「查看」按钮，不打断当前阅读 */
+  function toastAction(message, actionLabel, onAction) {
+    var box = $('#toast');
+    box.innerHTML = '';
+    var span = document.createElement('span');
+    span.textContent = message;
+    box.appendChild(span);
+    if (actionLabel) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'toast-action';
+      btn.textContent = actionLabel;
+      btn.addEventListener('click', function () {
+        box.hidden = true;
+        onAction();
+      });
+      box.appendChild(btn);
+    }
+    box.hidden = false;
+    clearTimeout(toast._t);
+    toast._t = setTimeout(function () { box.hidden = true; }, 8000);
   }
 
   function setStatus(mode, text) {
@@ -560,6 +773,18 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
   }
 
+  function postJSON(url, payload) {
+    return fetch(url, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    });
+  }
+
   function renderMarkdown(text) {
     if (!text) return '';
     if (!window.marked) return '<pre>' + escapeHtml(text) + '</pre>';
@@ -568,7 +793,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   }
 
   function setTheme(theme, rerender) {
-    state.theme = theme;
+    app.theme = theme;
     document.documentElement.dataset.theme = theme;
     localStorage.setItem('vr.theme', theme);
     $('#theme-btn').textContent = theme === 'dark' ? '主题：深色' : '主题：浅色';
@@ -583,68 +808,130 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
         });
       } catch (err) { /* 初始化失败时保持默认配置 */ }
     }
-    if (rerender && state.mode === 'md' && state.content) {
-      renderReading(state.content);
-      if (state.mm && typeof state.mm.destroy === 'function') {
-        try { state.mm.destroy(); } catch (err) { /* ignore */ }
-        state.mm = null;
-      }
-      renderMindmap(state.content);
+    if (rerender) {
+      [panes.primary, panes.secondary].forEach(function (pane) {
+        var v = pane.viewer;
+        if (v.mode !== 'md' || !v.content) return;
+        renderReading(pane, v.content);
+        if (v.mm && typeof v.mm.destroy === 'function') {
+          try { v.mm.destroy(); } catch (err) { /* ignore */ }
+          v.mm = null;
+        }
+        renderMindmap(pane, v.content);
+      });
     }
   }
 
-  /* ---------- 模式与子视图 ---------- */
+  /* ---------- 双窗格 ---------- */
 
-  function setMode(mode) {
-    if (state.mode === mode) return false;
-    state.mode = mode;
-    document.body.classList.remove('mode-md', 'mode-canvas', 'mode-html');
-    document.body.classList.add('mode-' + mode);
-    var saved = mode === 'md' ? localStorage.getItem('vr.sub.md') : null;
-    var ids = VIEWS[mode].map(function (v) { return v.id; });
-    state.subview = saved && ids.indexOf(saved) >= 0 ? saved : ids[0];
-    rebuildViewSwitch();
-    closeDrawer();
-    return true;
+  function createPane(root, name) {
+    var pane = {
+      name: name,
+      el: root,
+      content: $('.pane-content', root),
+      empty: $('.pane-empty', root),
+      mindmapPane: $('[data-pane-role="mindmap"]', root),
+      mindmapSvg: $('[data-pane-role="mindmap"] svg', root),
+      mindmapEmpty: $('.pane-mindmap-empty', root),
+      canvasPane: $('[data-pane-role="canvas"]', root),
+      canvasRoot: $('.pane-canvas-root', root),
+      artifactPane: $('[data-pane-role="artifact"]', root),
+      artifactFrame: $('.pane-artifact-frame', root),
+      artifactSource: $('.pane-artifact-source', root),
+      sessionId: '',
+      replyId: '',
+      viewingHistory: false,
+      viewer: {
+        mode: 'md', subview: 'reading', format: 'md', title: '', content: '',
+        currentFile: null, canvasData: null, artifactSrc: '', mtime: 0, mm: null,
+        drawer: {}, drawerSeq: 0, seq: 0
+      }
+    };
+    if (name === 'primary') {
+      pane.docTitle = $('#doc-title');
+      pane.docSub = $('#doc-sub');
+      pane.viewSwitch = $('#view-switch');
+    } else {
+      pane.docTitle = $('.pane-doc-title', root);
+      pane.docSub = $('.pane-doc-sub', root);
+      pane.viewSwitch = $('.view-switch', root);
+    }
+    return pane;
   }
 
-  function rebuildViewSwitch() {
-    var box = $('#view-switch');
+  var panes = {
+    primary: createPane($('#pane-primary'), 'primary'),
+    secondary: createPane($('#pane-secondary'), 'secondary')
+  };
+
+  function rebuildViewSwitch(pane) {
+    var box = pane.viewSwitch;
+    if (!box) return;
     box.innerHTML = '';
-    VIEWS[state.mode].forEach(function (v) {
+    VIEWS[pane.viewer.mode].forEach(function (v) {
       var btn = document.createElement('button');
       btn.type = 'button';
       btn.dataset.view = v.id;
       btn.textContent = v.label;
       btn.addEventListener('click', function () {
-        state.subview = v.id;
-        applySubview();
+        pane.viewer.subview = v.id;
+        applySubview(pane);
       });
       box.appendChild(btn);
     });
   }
 
-  function applySubview() {
-    closeDrawer();
-    $$('#view-switch button').forEach(function (btn) {
-      btn.dataset.active = String(btn.dataset.view === state.subview);
-    });
-    if (state.mode === 'md') localStorage.setItem('vr.sub.md', state.subview);
-
-    if (state.mode === 'md') {
-      var v = ['reading', 'mindmap', 'split'].indexOf(state.subview) >= 0 ? state.subview : 'reading';
-      ['reading', 'mindmap', 'split'].forEach(function (name) {
-        document.body.classList.toggle('view-' + name, name === v);
-      });
-      if (v !== 'reading') setTimeout(fitMindmap, 60);
-    } else if (state.mode === 'canvas') {
-      renderCanvas();
-    } else {
-      $('#artifact-pane').dataset.sub = state.subview;
-      $('#artifact-frame').hidden = state.subview === 'source';
-      $('#artifact-source').hidden = state.subview !== 'source';
-      syncArtifact();
+  function setMode(pane, mode) {
+    var v = pane.viewer;
+    var changed = v.mode !== mode;
+    v.mode = mode;
+    pane.el.classList.remove('mode-md', 'mode-canvas', 'mode-html');
+    pane.el.classList.add('mode-' + mode);
+    if (pane.name === 'primary') {
+      document.body.classList.remove('mode-md', 'mode-canvas', 'mode-html');
+      document.body.classList.add('mode-' + mode);
     }
+    var ids = VIEWS[mode].map(function (x) { return x.id; });
+    if (changed) {
+      var saved = mode === 'md' ? localStorage.getItem('vr.sub.md') : null;
+      v.subview = saved && ids.indexOf(saved) >= 0 ? saved : ids[0];
+      closeDrawer();
+    } else if (ids.indexOf(v.subview) < 0) {
+      v.subview = ids[0];
+    }
+    rebuildViewSwitch(pane);
+  }
+
+  function applySubview(pane) {
+    var v = pane.viewer;
+    if (v.mode === 'md' && pane.name === 'primary') closeDrawer();
+    $$('button', pane.viewSwitch).forEach(function (btn) {
+      btn.dataset.active = String(btn.dataset.view === v.subview);
+    });
+    if (pane.name === 'primary' && v.mode === 'md') {
+      localStorage.setItem('vr.sub.md', v.subview);
+    }
+    pane.el.classList.remove('view-reading', 'view-mindmap', 'view-split');
+    if (v.mode === 'md') {
+      var sub = ['reading', 'mindmap', 'split'].indexOf(v.subview) >= 0 ? v.subview : 'reading';
+      pane.el.classList.add('view-' + sub);
+      if (pane.name === 'primary') {
+        ['reading', 'mindmap', 'split'].forEach(function (name) {
+          document.body.classList.toggle('view-' + name, name === sub);
+        });
+      }
+      if (sub !== 'reading') setTimeout(function () { fitMindmap(pane); }, 60);
+      return;
+    }
+    pane.el.classList.add('view-reading');
+    if (v.mode === 'canvas') {
+      renderCanvas(pane);
+      return;
+    }
+    pane.artifactPane.dataset.sub = v.subview;
+    pane.artifactFrame.hidden = v.subview === 'source';
+    pane.artifactSource.hidden = v.subview !== 'source';
+    syncArtifact(pane);
   }
 
   /* ---------- Markdown 阅读 / 脑图（兼容模式） ---------- */
@@ -721,22 +1008,22 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
   }
 
-  function renderReading(md) {
+  function renderReading(pane, md) {
     if (!window.marked) {
-      article.innerHTML = '<pre>' + escapeHtml(md) + '</pre>';
+      pane.content.innerHTML = '<pre>' + escapeHtml(md) + '</pre>';
       return;
     }
     var extracted = extractMermaid(md);
     var html = marked.parse(extracted.text, { gfm: true, breaks: false });
-    article.innerHTML = injectMermaid(html, extracted.blocks);
-    buildSections(article);
-    wrapTables(article);
-    markExternalLinks(article);
-    renderDiagrams();
+    pane.content.innerHTML = injectMermaid(html, extracted.blocks);
+    buildSections(pane.content);
+    wrapTables(pane.content);
+    markExternalLinks(pane.content);
+    renderDiagrams(pane);
   }
 
-  function renderDiagrams() {
-    var nodes = $$('.mermaid-block', article);
+  function renderDiagrams(pane) {
+    var nodes = $$('.mermaid-block', pane.content);
     if (!nodes.length) return;
     if (!window.mermaid) {
       nodes.forEach(function (node) {
@@ -748,7 +1035,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       return chain.then(function () {
         var code = decodeURIComponent(node.dataset.code || '');
         if (!code.trim()) return;
-        var id = 'mmd-' + (++state.seq);
+        var id = 'mmd-' + (++mmdSeq);
         return mermaid.render(id, code).then(function (result) {
           node.innerHTML = result.svg;
           node.classList.add('rendered');
@@ -761,9 +1048,9 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }, Promise.resolve());
   }
 
-  function renderMindmap(md) {
+  function renderMindmap(pane, md) {
     var lib = window.markmap;
-    var fallback = $('#mindmap-empty');
+    var fallback = pane.mindmapEmpty;
     if (!lib || !lib.Transformer || !lib.Markmap) {
       fallback.hidden = false;
       fallback.textContent = '脑图库未加载，需要网络访问 CDN。';
@@ -780,8 +1067,8 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       return;
     }
     try {
-      if (!state.mm) {
-        state.mm = lib.Markmap.create($('#mindmap-svg'), {
+      if (!pane.viewer.mm) {
+        pane.viewer.mm = lib.Markmap.create(pane.mindmapSvg, {
           duration: 220,
           maxWidth: 300,
           spacingVertical: 8,
@@ -790,44 +1077,58 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
           initialExpandLevel: -1
         }, root);
       } else {
-        state.mm.setData(root);
+        pane.viewer.mm.setData(root);
       }
-      fitMindmap();
+      fitMindmap(pane);
     } catch (err) {
       fallback.hidden = false;
       fallback.textContent = '脑图渲染失败：' + (err && err.message ? err.message : err);
     }
   }
 
-  function fitMindmap() {
-    if (!state.mm) return;
-    var pane = $('#mindmap-pane');
-    if (!pane || pane.clientWidth < 60 || pane.clientHeight < 60) return;
+  function fitMindmap(pane) {
+    if (!pane.viewer.mm) return;
+    var box = pane.mindmapPane;
+    if (!box || box.clientWidth < 60 || box.clientHeight < 60) return;
     requestAnimationFrame(function () {
-      try { state.mm.fit(); } catch (err) { /* ignore */ }
+      try { pane.viewer.mm.fit(); } catch (err) { /* ignore */ }
     });
   }
 
-  /* ---------- Visual Canvas ---------- */
+  /* ---------- HTML Artifact ---------- */
 
-  function normalizeCanvas(data) {
-    var out = {
-      headline: data.headline || data.title || '',
-      badges: Array.isArray(data.badges) ? data.badges : [],
-      sections: Array.isArray(data.sections) ? data.sections.slice() : []
-    };
-    if (!out.sections.length) {
-      if (Array.isArray(data.nodes)) out.sections.push({ type: 'graph', nodes: data.nodes, edges: data.edges || [] });
-      if (Array.isArray(data.cards)) out.sections.push({ type: 'bento', cards: data.cards });
-      if (Array.isArray(data.steps)) out.sections.push({ type: 'steps', steps: data.steps });
-      if (Array.isArray(data.kpis)) out.sections.push({ type: 'kpis', items: data.kpis });
+  function artifactUrl(pane) {
+    var v = pane.viewer;
+    if (!v.content || !v.content.trim()) return 'about:blank';
+    if (v.sessionId && v.replyId) {
+      return '/artifact/session/' + encodeURIComponent(v.sessionId) + '/' + encodeURIComponent(v.replyId);
     }
-    return out;
+    if (v.currentFile) return '/artifact/history/' + encodeURIComponent(v.currentFile);
+    return '/artifact/latest?_=' + (v.mtime || 0);
   }
 
-  function registerDrawer(payload) {
-    var key = 'd' + (++state.drawerSeq);
-    state.drawer[key] = payload;
+  function syncArtifact(pane) {
+    var url = artifactUrl(pane);
+    if (url === pane.viewer.artifactSrc) return;
+    pane.viewer.artifactSrc = url;
+    pane.artifactFrame.src = url;
+    var source = pane.artifactSource;
+    if (url === 'about:blank') { source.textContent = '还没有内容。'; return; }
+    fetch(url, { cache: 'no-store' }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.text();
+    }).then(function (text) {
+      source.textContent = text;
+    }).catch(function (err) {
+      source.textContent = '源码加载失败：' + err.message;
+    });
+  }
+
+  /* ---------- Inspector 抽屉（两个窗格共用） ---------- */
+
+  function registerDrawer(pane, payload) {
+    var key = 'd' + (++pane.viewer.drawerSeq);
+    pane.viewer.drawer[key] = payload;
     return key;
   }
 
@@ -878,6 +1179,26 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     document.body.classList.remove('drawer-open');
   }
 
+  function drawerOpen() {
+    return drawer.classList.contains('open');
+  }
+  /* ---------- Visual Canvas ---------- */
+
+  function normalizeCanvas(data) {
+    var out = {
+      headline: data.headline || data.title || '',
+      badges: Array.isArray(data.badges) ? data.badges : [],
+      sections: Array.isArray(data.sections) ? data.sections.slice() : []
+    };
+    if (!out.sections.length) {
+      if (Array.isArray(data.nodes)) out.sections.push({ type: 'graph', nodes: data.nodes, edges: data.edges || [] });
+      if (Array.isArray(data.cards)) out.sections.push({ type: 'bento', cards: data.cards });
+      if (Array.isArray(data.steps)) out.sections.push({ type: 'steps', steps: data.steps });
+      if (Array.isArray(data.kpis)) out.sections.push({ type: 'kpis', items: data.kpis });
+    }
+    return out;
+  }
+
   function renderKpis(sec) {
     var items = Array.isArray(sec.items) ? sec.items : [];
     if (!items.length) return '';
@@ -892,7 +1213,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }).join('') + '</div>';
   }
 
-  /* ==== VR_GRAPH_CORE_START ==== */
+/* ==== VR_GRAPH_CORE_START ==== */
   /* 纯几何计算，不依赖 DOM；test_visual_reply.py 会把这段抽出来在 node vm 里跑。 */
   var GraphCore = (function () {
     'use strict';
@@ -1335,7 +1656,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   })();
   /* ==== VR_GRAPH_CORE_END ==== */
 
-  function renderGraph(sec) {
+  function renderGraph(pane, sec) {
     var nodes = (Array.isArray(sec.nodes) ? sec.nodes : []).filter(function (n) {
       return n && n.id !== undefined && n.id !== null;
     });
@@ -1365,7 +1686,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     var cards = g.nodes.map(function (p) {
       var n = p.source;
       var status = n.status || 'info';
-      var key = registerDrawer({
+      var key = registerDrawer(pane, {
         kicker: '节点详情',
         title: n.label || String(n.id),
         tags: [n.tag, n.layer !== undefined && n.layer !== null ? 'layer ' + n.layer : ''].filter(Boolean),
@@ -1403,7 +1724,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       '</div>';
   }
 
-  function renderComparison(sec) {
+  function renderComparison(pane, sec) {
     var items = Array.isArray(sec.items) ? sec.items : [];
     if (!items.length) return '';
     var dims = [];
@@ -1434,7 +1755,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }
 
     return '<div class="cmp-grid">' + items.map(function (it) {
-      var key = registerDrawer({
+      var key = registerDrawer(pane, {
         kicker: '方案详情',
         title: it.name || '未命名方案',
         tags: [it.badge, it.recommended ? '推荐' : ''].filter(Boolean),
@@ -1453,12 +1774,12 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }).join('') + '</div>';
   }
 
-  function renderBento(sec) {
+  function renderBento(pane, sec) {
     var cards = Array.isArray(sec.cards) ? sec.cards : [];
     if (!cards.length) return '';
     return '<div class="bento">' + cards.map(function (c) {
       var span = Number(c.span) === 2 ? 2 : 1;
-      var key = registerDrawer({
+      var key = registerDrawer(pane, {
         kicker: '卡片详情',
         title: c.title || '未命名卡片',
         tags: [c.tag, c.tone].filter(Boolean),
@@ -1476,12 +1797,12 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }).join('') + '</div>';
   }
 
-  function renderSteps(sec) {
+  function renderSteps(pane, sec) {
     var steps = Array.isArray(sec.steps) ? sec.steps : [];
     if (!steps.length) return '';
     return '<div class="step-track">' + steps.map(function (s, i) {
       var status = s.status || 'pending';
-      var key = registerDrawer({
+      var key = registerDrawer(pane, {
         kicker: '步骤详情',
         title: s.title || ('第 ' + (i + 1) + ' 步'),
         tags: [status],
@@ -1498,7 +1819,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }).join('') + '</div>';
   }
 
-  function renderSection(sec) {
+  function renderSection(pane, sec) {
     if (!sec || typeof sec !== 'object') return '';
     var type = sec.type;
     if (!type) {
@@ -1510,28 +1831,29 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }
     var body = '';
     if (type === 'kpis') body = renderKpis(sec);
-    else if (type === 'graph') body = renderGraph(sec);
-    else if (type === 'comparison') body = renderComparison(sec);
-    else if (type === 'bento') body = renderBento(sec);
-    else if (type === 'steps') body = renderSteps(sec);
+    else if (type === 'graph') body = renderGraph(pane, sec);
+    else if (type === 'comparison') body = renderComparison(pane, sec);
+    else if (type === 'bento') body = renderBento(pane, sec);
+    else if (type === 'steps') body = renderSteps(pane, sec);
     else return '';
     if (!body) return '';
     var title = sec.title ? '<div class="cv-sec-title">' + escapeHtml(sec.title) + '</div>' : '';
     return '<section class="cv-section" data-type="' + escapeAttr(type) + '">' + title + body + '</section>';
   }
 
-  function renderCanvas() {
-    if (!state.canvasData) {
-      canvasRoot.innerHTML = '<div class="empty" style="height:60vh">还没有内容。让 Agent 发布一条回复即可在此看到。</div>';
+  function renderCanvas(pane) {
+    var root = pane.canvasRoot;
+    var data = pane.viewer.canvasData;
+    if (!data) {
+      root.innerHTML = '<div class="empty" style="height:60vh">还没有内容。让 Agent 发布一条回复即可在此看到。</div>';
       return;
     }
-    if (state.subview === 'raw') {
-      canvasRoot.innerHTML = '<pre class="raw-json">' + escapeHtml(JSON.stringify(state.canvasData, null, 2)) + '</pre>';
+    if (pane.viewer.subview === 'raw') {
+      root.innerHTML = '<pre class="raw-json">' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>';
       return;
     }
-    var data = state.canvasData;
-    state.drawer = {};
-    state.drawerSeq = 0;
+    pane.viewer.drawer = {};
+    pane.viewer.drawerSeq = 0;
     var html = '';
     if (data.headline) html += '<h1 class="canvas-headline">' + escapeHtml(data.headline) + '</h1>';
     if (data.badges.length) {
@@ -1544,12 +1866,12 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     if (!data.sections.length) {
       html += '<div class="cv-section"><div class="empty" style="height:200px">画布为空：请提供 sections / nodes / cards。</div></div>';
     } else {
-      data.sections.forEach(function (sec) { html += renderSection(sec); });
+      data.sections.forEach(function (sec) { html += renderSection(pane, sec); });
     }
-    canvasRoot.innerHTML = html;
-    bindGraphHover();
-    bindGraphTools();
-    requestAnimationFrame(fitGraphs);
+    root.innerHTML = html;
+    bindGraphHover(pane);
+    bindGraphTools(pane);
+    requestAnimationFrame(function () { fitGraphs(pane); });
   }
 
   function neighbors(startId, adj) {
@@ -1591,15 +1913,15 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     applyGraphScale(wrap, Math.max(GRAPH_MIN_SCALE, s));
   }
 
-  function fitGraphs() {
-    $$('.graph-wrap', canvasRoot).forEach(function (wrap) {
+  function fitGraphs(pane) {
+    $$('.graph-wrap', pane.canvasRoot).forEach(function (wrap) {
       if (wrap.dataset.mode === 'manual') return;
       fitGraph(wrap);
     });
   }
 
-  function bindGraphTools() {
-    $$('.graph-block', canvasRoot).forEach(function (block) {
+  function bindGraphTools(pane) {
+    $$('.graph-block', pane.canvasRoot).forEach(function (block) {
       var wrap = $('.graph-wrap', block);
       if (!wrap) return;
       $$('[data-gact]', block).forEach(function (btn) {
@@ -1662,8 +1984,8 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
   }
 
-  function bindGraphHover() {
-    $$('.graph-wrap', canvasRoot).forEach(function (wrap) {
+  function bindGraphHover(pane) {
+    $$('.graph-wrap', pane.canvasRoot).forEach(function (wrap) {
       $$('.g-node', wrap).forEach(function (node) {
         node.addEventListener('mouseenter', function () { highlightGraph(wrap, node.dataset.node); });
         node.addEventListener('mouseleave', function () { highlightGraph(wrap, null); });
@@ -1671,50 +1993,49 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
   }
 
-  /* ---------- HTML Artifact ---------- */
-
-  function artifactUrl() {
-    if (!state.content || !state.content.trim()) return 'about:blank';
-    if (state.currentFile) return '/artifact/history/' + encodeURIComponent(state.currentFile);
-    return '/artifact/latest?_=' + state.latestMtime;
-  }
-
-  function syncArtifact() {
-    var url = artifactUrl();
-    if (url === state.artifactSrc) return;
-    state.artifactSrc = url;
-    $('#artifact-frame').src = url;
-    var source = $('#artifact-source');
-    if (url === 'about:blank') { source.textContent = '还没有内容。'; return; }
-    fetch(url, { cache: 'no-store' }).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.text();
-    }).then(function (text) {
-      source.textContent = text;
-    }).catch(function (err) {
-      source.textContent = '源码加载失败：' + err.message;
-    });
-  }
-
   /* ---------- 文档装载 ---------- */
 
-  function renderDoc(content, format, filename) {
-    state.content = content || '';
-    state.format = format || 'md';
-    state.currentFile = filename || null;
-    state.artifactSrc = '';
-    state.canvasData = null;
+  function setPaneHeader(pane, doc, hasContent) {
+    var title = doc.title || '未命名回复';
+    var sub = doc.updated_at ? '更新于 ' + fmtTime(doc.updated_at) : '等待发布';
+    if (doc.session_label) sub = doc.session_label + ' · ' + sub;
+    if (doc.kind === 'history') sub = '历史记录 · ' + String(doc.format || 'md').toUpperCase() + ' · ' + fmtTime(doc.updated_at);
+    if (hasContent) sub += ' · ' + String(doc.content || '').length + ' 字符 · ' + String(doc.format || 'md').toUpperCase();
+    pane.docTitle.textContent = title;
+    pane.docSub.textContent = sub;
+    if (pane.name === 'primary') updateDocumentTitle();
+  }
 
-    var hasContent = !!(state.content && state.content.trim());
-    var mode = state.format;
+  /* 单一渲染入口：主窗格与分屏窗格共用同一套画布 / Markdown / Artifact 逻辑 */
+  function renderIntoPane(pane, doc, opts) {
+    opts = opts || {};
+    var v = pane.viewer;
+    v.content = doc.content || '';
+    v.format = doc.format || 'md';
+    v.title = doc.title || '';
+    v.currentFile = doc.filename || null;
+    v.artifactSrc = '';
+    v.canvasData = null;
+    v.drawer = {};
+    v.drawerSeq = 0;
+    v.seq = Number(doc.seq) || 0;
+    v.mtime = doc.mtime || 0;
+    v.sessionId = doc.session_id || pane.sessionId || '';
+    v.replyId = doc.reply_id || '';
+    if (v.sessionId) pane.sessionId = v.sessionId;
+    pane.replyId = v.replyId;
+    pane.viewingHistory = !!opts.history;
 
+    var hasContent = !!(v.content && v.content.trim());
+    var mode = v.format;
     if (mode === 'json') {
-      if (!hasContent) mode = 'md';
-      else {
+      if (!hasContent) {
+        mode = 'md';
+      } else {
         try {
-          var parsed = JSON.parse(state.content);
+          var parsed = JSON.parse(v.content);
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            state.canvasData = normalizeCanvas(parsed);
+            v.canvasData = normalizeCanvas(parsed);
             mode = 'canvas';
           } else {
             mode = 'md';
@@ -1725,116 +2046,720 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       }
     }
 
+    setMode(pane, mode);
+    setPaneHeader(pane, doc, hasContent);
+
     if (mode === 'md') {
-      emptyBox.hidden = hasContent;
-      article.hidden = !hasContent;
+      pane.empty.hidden = hasContent;
+      pane.content.hidden = !hasContent;
       if (hasContent) {
-        renderReading(state.content);
-        renderMindmap(state.content);
+        renderReading(pane, v.content);
+        renderMindmap(pane, v.content);
+      } else {
+        pane.content.innerHTML = '';
       }
     }
-    if (mode === 'canvas' || mode === 'html') state.subview = VIEWS[mode][0].id;
-    setMode(mode);
-    applySubview();
+    applySubview(pane);
+  }
+  /* ---------- 会话栏 / 未读 ---------- */
+
+  function saveSeen() {
+    try { localStorage.setItem('vr.lastSeen', JSON.stringify(app.lastSeen)); } catch (err) { /* ignore */ }
   }
 
-  function setHeader(title, sub) {
-    state.title = title || '未命名回复';
-    $('#doc-title').textContent = state.title;
-    $('#doc-sub').textContent = sub || '';
-    document.title = state.title + ' · Visual Reply';
+  function markSeen(sessionId, seq) {
+    if (!sessionId) return;
+    var current = Number(app.lastSeen[sessionId] || 0);
+    if (Number(seq || 0) > current) {
+      app.lastSeen[sessionId] = Number(seq || 0);
+      saveSeen();
+      renderRail();
+    }
   }
 
-  function applyLatest(data) {
-    state.latestLoaded = true;
-    state.latestMtime = data.mtime || 0;
-    state.viewingHistory = false;
-    state.format = data.format || 'md';
-    $('#back-btn').hidden = true;
-    var sub = data.updated_at ? '更新于 ' + fmtTime(data.updated_at) : '等待发布';
-    if (data.content) sub += ' · ' + data.content.length + ' 字符 · ' + String(state.format).toUpperCase();
-    setHeader(data.title, sub);
-    renderDoc(data.content || '', state.format, null);
-    $('#history-select').value = '';
+  function unreadCount(session) {
+    var seen = Number(app.lastSeen[session.id] || 0);
+    if (Number(session.seq || 0) <= seen) return 0;
+    var rows = app.replies[session.id];
+    if (rows && rows.length) {
+      var unread = rows.filter(function (r) { return Number(r.seq || 0) > seen; }).length;
+      if (unread) return unread;
+    }
+    return 1;
   }
 
-  function showHistoryItem(data, filename) {
-    state.viewingHistory = true;
-    var fmt = data.format || 'md';
-    setHeader(data.title || filename, '历史记录 · ' + String(fmt).toUpperCase() + ' · ' + fmtTime(data.updated_at));
-    renderDoc(data.content || '', fmt, filename);
-    $('#back-btn').hidden = false;
+  function totalUnread() {
+    var total = 0;
+    app.sessions.forEach(function (s) { total += unreadCount(s); });
+    return total;
   }
 
-  function refreshHistory() {
-    return fetchJSON('/api/history').then(function (data) {
-      var sel = $('#history-select');
-      var current = sel.value;
+  /* 标题栏显示跨会话未读总数：(N) 标题 · Visual Reply */
+  function updateDocumentTitle() {
+    var base = panes.primary.viewer.title || '';
+    var unread = totalUnread();
+    var prefix = unread > 0 ? '(' + unread + ') ' : '';
+    document.title = base ? prefix + base + ' · Visual Reply' : prefix + 'Visual Reply';
+  }
+
+  function railEmpty(text) {
+    var box = document.createElement('div');
+    box.className = 'rail-empty';
+    box.textContent = text;
+    return box;
+  }
+
+  function railButton(label, title, onClick) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.title = title;
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  function sessionCard(session) {
+    var card = document.createElement('div');
+    card.className = 'rail-card';
+    card.dataset.sid = session.id;
+    card.dataset.active = String(panes.primary.sessionId === session.id);
+    card.title = session.label + (session.project ? ' · ' + session.project : '');
+
+    var accent = document.createElement('span');
+    accent.className = 'rail-accent';
+    accent.style.background = session.color || 'var(--accent)';
+    card.appendChild(accent);
+
+    var main = document.createElement('div');
+    main.className = 'rail-main';
+    var top = document.createElement('div');
+    top.className = 'rail-top';
+    var label = document.createElement('span');
+    label.className = 'rail-label';
+    label.textContent = session.label || session.id;
+    top.appendChild(label);
+    if (session.client) {
+      var client = document.createElement('span');
+      client.className = 'rail-client';
+      client.textContent = session.client;
+      top.appendChild(client);
+    }
+    var sub = document.createElement('div');
+    sub.className = 'rail-sub';
+    sub.textContent = session.last_title || '暂无回复';
+    var meta = document.createElement('div');
+    meta.className = 'rail-meta';
+    meta.textContent = (session.reply_count || 0) + ' 条 · ' + fmtTime(session.updated_at);
+    main.appendChild(top);
+    main.appendChild(sub);
+    main.appendChild(meta);
+    card.appendChild(main);
+
+    var unread = unreadCount(session);
+    if (unread) {
+      var badge = document.createElement('span');
+      badge.className = 'rail-unread';
+      badge.textContent = unread > 9 ? '9+' : String(unread);
+      card.appendChild(badge);
+    }
+
+    var actions = document.createElement('div');
+    actions.className = 'rail-actions';
+    actions.appendChild(railButton(session.pinned ? '★' : '☆', session.pinned ? '取消置顶' : '置顶', function (ev) {
+      ev.stopPropagation();
+      togglePin(session);
+    }));
+    actions.appendChild(railButton('改', '重命名会话', function (ev) {
+      ev.stopPropagation();
+      renameSession(session);
+    }));
+    actions.appendChild(railButton('◫', '在分屏中打开', function (ev) {
+      ev.stopPropagation();
+      openSplit(session.id);
+    }));
+    card.appendChild(actions);
+
+    card.addEventListener('click', function () { focusSession(session.id); });
+    return card;
+  }
+
+  function renderRail() {
+    updateDocumentTitle();
+    var list = $('#rail-list');
+    var feed = $('#feed-list');
+    var isFeed = app.railView === 'feed';
+    list.hidden = isFeed;
+    feed.hidden = !isFeed;
+    $('#rail-title').textContent = isFeed ? '全局时间线'
+      : ('会话' + (app.sessions.length ? ' · ' + app.sessions.length : ''));
+
+    if (isFeed) { renderFeed(); return; }
+
+    list.innerHTML = '';
+    var rows = app.sessions.slice();
+    if (app.filter === 'unread') rows = rows.filter(function (s) { return unreadCount(s) > 0; });
+    else if (app.filter === 'pinned') rows = rows.filter(function (s) { return !!s.pinned; });
+
+    if (!rows.length) {
+      list.appendChild(railEmpty(app.sessions.length ? '没有符合筛选条件的会话' : '还没有会话。让 Agent 发布一条回复即可。'));
+      return;
+    }
+    rows.forEach(function (s) { list.appendChild(sessionCard(s)); });
+  }
+
+  function renderFeed() {
+    var box = $('#feed-list');
+    fetchJSON('/api/feed?limit=60').then(function (data) {
       var items = data.items || [];
-      sel.innerHTML = '';
-      sel.appendChild(new Option('最新内容', ''));
+      box.innerHTML = '';
+      if (!items.length) {
+        box.appendChild(railEmpty('还没有跨会话记录。'));
+        return;
+      }
       items.forEach(function (item) {
-        var label = fmtTime(item.updated_at) + '  [' + String(item.format || 'md').toUpperCase() + '] ' +
-          (item.title || item.filename);
-        sel.appendChild(new Option(label, item.filename));
+        var row = document.createElement('div');
+        row.className = 'feed-item';
+        var seq = document.createElement('span');
+        seq.className = 'feed-seq';
+        seq.textContent = item.legacy ? 'v3' : '#' + (item.seq || 0);
+        var main = document.createElement('div');
+        main.className = 'feed-main';
+        var title = document.createElement('div');
+        title.className = 'feed-title';
+        title.textContent = item.title || item.reply_id || item.filename || '未命名回复';
+        var sub = document.createElement('div');
+        sub.className = 'feed-sub';
+        sub.textContent = (item.session_label || (item.legacy ? '历史归档' : '')) +
+          ' · ' + String(item.format || 'md').toUpperCase() + ' · ' + fmtTime(item.updated_at);
+        main.appendChild(title);
+        main.appendChild(sub);
+        row.appendChild(seq);
+        row.appendChild(main);
+        row.addEventListener('click', function () {
+          if (item.legacy) loadLegacyHistory(item.filename);
+          else focusSession(item.session_id, { reply: item.reply_id });
+        });
+        box.appendChild(row);
       });
-      var exists = items.some(function (item) { return item.filename === current; });
-      sel.value = exists ? current : '';
-    }).catch(function () { /* 历史列表失败不打断主流程 */ });
+    }).catch(function () {
+      box.innerHTML = '';
+      box.appendChild(railEmpty('全局时间线加载失败。'));
+    });
   }
 
-  function poll() {
-    if (state.polling) return Promise.resolve();
-    state.polling = true;
-    return fetchJSON('/api/latest?_=' + Date.now()).then(function (data) {
-      setStatus('online', '已同步 ' + clock());
-      if (!state.latestLoaded) {
-        applyLatest(data);
-        return refreshHistory();
-      }
-      if (data.mtime !== state.latestMtime) {
-        state.latestMtime = data.mtime;
-        if (state.viewingHistory) {
-          setStatus('stale', '有新内容');
-          $('#back-btn').hidden = false;
+  function setRailView(view) {
+    app.railView = view;
+    $('#feed-btn').textContent = view === 'feed' ? '返回会话列表' : '全局时间线';
+    renderRail();
+  }
+
+  function refitPanes() {
+    setTimeout(function () {
+      fitGraphs(panes.primary);
+      fitGraphs(panes.secondary);
+      fitMindmap(panes.primary);
+      fitMindmap(panes.secondary);
+    }, 210);
+  }
+
+  function toggleRail() {
+    var rail = $('#session-rail');
+    var open = rail.dataset.open !== 'false';
+    rail.dataset.open = String(!open);
+    try { localStorage.setItem('vr.rail', open ? '0' : '1'); } catch (err) { /* ignore */ }
+    refitPanes();
+  }
+
+  /* ---------- 数据加载 ---------- */
+
+  function refreshSessions() {
+    return fetchJSON('/api/sessions').then(function (data) {
+      app.sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      var seq = Number(data.seq || 0);
+      if (seq > app.globalSeq) app.globalSeq = seq;
+      app.latestSessionId = data.latest_session_id || app.latestSessionId;
+      app.latestReplyId = data.latest_reply_id || app.latestReplyId;
+      renderRail();
+      renderSplitSelect();
+      return data;
+    }).catch(function () { return null; });
+  }
+
+  function loadSessionReplies(sessionId, force) {
+    if (!sessionId) return Promise.resolve([]);
+    if (app.replies[sessionId] && !force) return Promise.resolve(app.replies[sessionId]);
+    return fetchJSON('/api/sessions/' + encodeURIComponent(sessionId) + '/replies?limit=200')
+      .then(function (data) {
+        app.replies[sessionId] = Array.isArray(data.replies) ? data.replies : [];
+        return app.replies[sessionId];
+      })
+      .catch(function () { return app.replies[sessionId] || []; });
+  }
+
+  function loadReply(pane, sessionId, replyId, opts) {
+    opts = opts || {};
+    if (!sessionId || !replyId) return Promise.resolve(null);
+    return fetchJSON('/api/sessions/' + encodeURIComponent(sessionId) + '/replies/' + encodeURIComponent(replyId))
+      .then(function (data) {
+        var reply = data.reply || {};
+        var session = data.session || {};
+        var doc = {
+          format: reply.format || 'md',
+          title: reply.title || '',
+          content: data.content || '',
+          updated_at: reply.updated_at || '',
+          mtime: Date.now(),
+          seq: reply.seq || 0,
+          session_id: sessionId,
+          reply_id: reply.reply_id || replyId,
+          session_label: session.label || '',
+          kind: 'session'
+        };
+        var isLatest = !!session.last_reply_id && session.last_reply_id === doc.reply_id;
+        pane.sessionId = sessionId;
+        renderIntoPane(pane, doc, { history: !isLatest });
+        if (pane.name === 'primary') {
+          if (isLatest) {
+            markSeen(sessionId, doc.seq);
+            $('#new-reply-banner').hidden = true;
+            app.pendingBanner = null;
+          }
+          if (!opts.noUrl) writeUrl({ session: sessionId, reply: doc.reply_id });
+          $('#back-btn').hidden = isLatest;
+          refreshHistory();
         } else {
-          applyLatest(data);
+          renderSplitReplies();
         }
-        return refreshHistory();
-      }
+        renderRail();
+        setStatus('online', '已同步 ' + clock());
+        return data;
+      })
+      .catch(function (err) {
+        setStatus('stale', '回复加载失败');
+        toast('回复加载失败：' + err.message);
+        return null;
+      });
+  }
+
+  function loadGlobalLatest(pane) {
+    return fetchJSON('/api/latest?_=' + Date.now()).then(function (data) {
+      pane.sessionId = data.session_id || '';
+      pane.replyId = data.reply_id || '';
+      pane.viewingHistory = false;
+      renderIntoPane(pane, data, { history: false });
+      $('#back-btn').hidden = true;
+      setStatus('online', '已同步 ' + clock());
+      refreshHistory();
+      renderRail();
+      return data;
     }).catch(function () {
       setStatus('offline', '连接中断，重试中');
-    }).then(function () {
-      state.polling = false;
+      return null;
     });
   }
 
   function refreshLatestNow() {
-    return fetchJSON('/api/latest?_=' + Date.now()).then(function (data) {
-      applyLatest(data);
-      setStatus('online', '已同步 ' + clock());
-    }).catch(function () {
-      setStatus('offline', '连接中断，重试中');
-    });
+    var pane = panes.primary;
+    app.pendingBanner = null;
+    $('#new-reply-banner').hidden = true;
+    $('#back-btn').hidden = true;
+    if (app.mode === 'lock' && pane.sessionId) {
+      return loadSessionReplies(pane.sessionId, true).then(function (rows) {
+        if (rows.length) return loadReply(pane, pane.sessionId, rows[0].reply_id);
+        return loadGlobalLatest(pane);
+      });
+    }
+    return loadGlobalLatest(pane);
   }
 
-  function loadHistory(filename) {
-    if (!filename) {
-      refreshLatestNow();
-      return;
-    }
-    fetchJSON('/api/history/' + encodeURIComponent(filename)).then(function (data) {
-      showHistoryItem(data, filename);
+  function loadLegacyHistory(filename) {
+    if (!filename) return Promise.resolve(null);
+    return fetchJSON('/api/history/' + encodeURIComponent(filename)).then(function (data) {
+      var pane = panes.primary;
+      pane.sessionId = data.session_id || '';
+      pane.replyId = data.reply_id || '';
+      pane.viewingHistory = true;
+      renderIntoPane(pane, {
+        format: data.format,
+        title: data.title || filename,
+        content: data.content || '',
+        updated_at: data.updated_at,
+        mtime: data.mtime || 0,
+        seq: data.seq || 0,
+        session_id: data.session_id || '',
+        reply_id: data.reply_id || '',
+        filename: filename,
+        kind: 'history'
+      }, { history: true });
+      $('#back-btn').hidden = false;
+      $('#new-reply-banner').hidden = true;
       setStatus('online', '浏览历史');
+      return data;
     }).catch(function (err) {
       toast('历史记录加载失败：' + err.message);
       refreshHistory();
+      return null;
     });
   }
 
+  function refreshHistory() {
+    var sel = $('#history-select');
+    var previous = sel.value;
+    var sessionId = panes.primary.sessionId;
+    var keep = function () {
+      var exists = Array.prototype.some.call(sel.options, function (o) { return o.value === previous; });
+      sel.value = exists ? previous : '';
+    };
+
+    if (!sessionId) {
+      return fetchJSON('/api/history').then(function (data) {
+        sel.innerHTML = '';
+        sel.appendChild(new Option('最新内容', ''));
+        (data.items || []).forEach(function (item) {
+          var label = fmtTime(item.updated_at) + '  [' + String(item.format || 'md').toUpperCase() + '] ' +
+            (item.title || item.filename);
+          sel.appendChild(new Option(label, 'h:' + item.filename));
+        });
+        keep();
+      }).catch(function () { /* 历史列表失败不打断主流程 */ });
+    }
+
+    return loadSessionReplies(sessionId, true).then(function (rows) {
+      sel.innerHTML = '';
+      sel.appendChild(new Option('最新内容', ''));
+      var total = rows.length;
+      rows.forEach(function (row, index) {
+        var number = total - index;
+        var text = '#' + number + (index === 0 ? ' (最新)' : '') + ' · ' + (row.title || row.reply_id);
+        sel.appendChild(new Option(text, 'r:' + row.reply_id));
+      });
+      return fetchJSON('/api/history').then(function (data) {
+        var items = data.items || [];
+        if (!items.length) return;
+        var group = document.createElement('optgroup');
+        group.label = '历史归档（v3）';
+        items.forEach(function (item) {
+          var label = fmtTime(item.updated_at) + '  [' + String(item.format || 'md').toUpperCase() + '] ' +
+            (item.title || item.filename);
+          group.appendChild(new Option(label, 'h:' + item.filename));
+        });
+        sel.appendChild(group);
+      }).catch(function () { /* ignore */ });
+    }).then(keep).catch(function () { /* ignore */ });
+  }
+
+  function loadHistory(value) {
+    if (!value) return refreshLatestNow();
+    if (value.indexOf('r:') === 0) {
+      var replyId = value.slice(2);
+      if (panes.primary.sessionId) return loadReply(panes.primary, panes.primary.sessionId, replyId);
+      return Promise.resolve(null);
+    }
+    if (value.indexOf('h:') === 0) return loadLegacyHistory(value.slice(2));
+    return refreshLatestNow();
+  }
+
+  /* ---------- 会话焦点 / 分屏 / 元数据 ---------- */
+
+  function renderEmptyPane(pane, message) {
+    pane.viewer.content = '';
+    pane.viewer.canvasData = null;
+    pane.content.innerHTML = '';
+    pane.content.hidden = true;
+    pane.empty.hidden = false;
+    pane.empty.textContent = message;
+    pane.docTitle.textContent = '空会话';
+    pane.docSub.textContent = '';
+  }
+
+  function focusSession(sessionId, opts) {
+    opts = opts || {};
+    if (!opts.keepMode) {
+      app.mode = 'lock';
+      updateModeButton();
+    }
+    var pane = panes.primary;
+    pane.sessionId = sessionId;
+    pane.viewingHistory = false;
+    app.pendingBanner = null;
+    $('#new-reply-banner').hidden = true;
+    if (!opts.silent) writeUrl({ session: sessionId, reply: opts.reply || null, mode: 'lock' });
+    return loadSessionReplies(sessionId, true).then(function (rows) {
+      renderRail();
+      var replyId = opts.reply || (rows[0] && rows[0].reply_id);
+      if (!replyId) {
+        pane.replyId = '';
+        renderEmptyPane(pane, '这个会话还没有回复。');
+        refreshHistory();
+        return null;
+      }
+      return loadReply(pane, sessionId, replyId, { noUrl: !!opts.silent });
+    });
+  }
+
+  function renderSplitSelect() {
+    var sel = $('.sec-session-select');
+    if (!sel) return;
+    var current = panes.secondary.sessionId;
+    sel.innerHTML = '';
+    sel.appendChild(new Option('选择分屏会话', ''));
+    app.sessions.forEach(function (s) {
+      if (s.id === panes.primary.sessionId) return;
+      sel.appendChild(new Option(s.label, s.id));
+    });
+    var exists = app.sessions.some(function (s) { return s.id === current; });
+    sel.value = exists ? current : '';
+  }
+
+  function renderSplitReplies() {
+    var sel = $('.sec-reply-select');
+    if (!sel) return;
+    var rows = app.replies[panes.secondary.sessionId] || [];
+    var previous = sel.value;
+    sel.innerHTML = '';
+    sel.appendChild(new Option('最新', ''));
+    var total = rows.length;
+    rows.forEach(function (row, index) {
+      var number = total - index;
+      var text = '#' + number + (index === 0 ? ' (最新)' : '') + ' · ' + (row.title || row.reply_id);
+      sel.appendChild(new Option(text, row.reply_id));
+    });
+    var exists = Array.prototype.some.call(sel.options, function (o) { return o.value === previous; });
+    sel.value = exists ? previous : '';
+  }
+
+  function splitVisible() {
+    return !$('#pane-secondary').hidden;
+  }
+
+  function openSplit(sessionId, opts) {
+    opts = opts || {};
+    if (!sessionId) return Promise.resolve(null);
+    if (sessionId === panes.primary.sessionId) {
+      if (!opts.silent) toast('请选择另一个会话来分屏');
+      return Promise.resolve(null);
+    }
+    var pane = panes.secondary;
+    $('#pane-secondary').hidden = false;
+    $('#stage').dataset.split = app.layout || 'h';
+    pane.sessionId = sessionId;
+    if (!opts.silent) writeUrl({ split: sessionId, layout: app.layout || 'h' });
+    renderSplitSelect();
+    refitPanes();
+    return loadSessionReplies(sessionId, true).then(function (rows) {
+      renderRail();
+      renderSplitReplies();
+      if (rows[0]) return loadReply(pane, sessionId, rows[0].reply_id, { noUrl: true });
+      renderEmptyPane(pane, '这个会话还没有回复。');
+      return null;
+    });
+  }
+
+  function closeSplit() {
+    var pane = panes.secondary;
+    $('#pane-secondary').hidden = true;
+    $('#stage').dataset.split = '';
+    pane.sessionId = '';
+    pane.replyId = '';
+    pane.viewer.content = '';
+    pane.viewer.canvasData = null;
+    pane.viewer.drawer = {};
+    if (pane.viewer.mm && typeof pane.viewer.mm.destroy === 'function') {
+      try { pane.viewer.mm.destroy(); } catch (err) { /* ignore */ }
+      pane.viewer.mm = null;
+    }
+    var sel = $('.sec-reply-select');
+    if (sel) sel.innerHTML = '<option value="">最新</option>';
+    writeUrl({ split: null, layout: null });
+    renderRail();
+    refitPanes();
+  }
+
+  function togglePin(session) {
+    return postJSON('/api/sessions/' + encodeURIComponent(session.id), { pinned: !session.pinned })
+      .then(function () { return refreshSessions(); })
+      .catch(function (err) { toast('置顶失败：' + err.message); });
+  }
+
+  function renameSession(session) {
+    var name = window.prompt('会话显示名', session.label || '');
+    if (name === null) return;
+    name = String(name).trim();
+    if (!name) return;
+    postJSON('/api/sessions/' + encodeURIComponent(session.id), { label: name })
+      .then(function () { return refreshSessions(); })
+      .catch(function (err) { toast('重命名失败：' + err.message); });
+  }
+
+  /* ---------- URL 状态 ---------- */
+
+  function readUrl() {
+    var params = new URLSearchParams(window.location.search);
+    return {
+      session: params.get('session') || '',
+      reply: params.get('reply') || '',
+      split: params.get('split') || '',
+      layout: params.get('layout') || '',
+      mode: params.get('mode') || ''
+    };
+  }
+
+  function writeUrl(patch) {
+    var params = new URLSearchParams(window.location.search);
+    Object.keys(patch || {}).forEach(function (key) {
+      var value = patch[key];
+      if (value === null || value === undefined || value === '') params.delete(key);
+      else params.set(key, String(value));
+    });
+    var query = params.toString();
+    window.history.replaceState(null, '', window.location.pathname + (query ? '?' + query : ''));
+  }
+
+  function updateModeButton() {
+    var btn = $('#mode-btn');
+    btn.textContent = app.mode === 'lock' ? '锁定会话' : '跟随全局';
+    btn.dataset.mode = app.mode;
+  }
+
+  function applyUrl() {
+    var url = readUrl();
+    if (url.mode === 'lock' || url.mode === 'global') app.mode = url.mode;
+    else if (url.session) app.mode = 'lock';
+    app.layout = url.layout === 'v' ? 'v' : 'h';
+    updateModeButton();
+    var job;
+    if (url.session) {
+      job = focusSession(url.session, {
+        reply: url.reply,
+        silent: true,
+        keepMode: url.mode === 'global'
+      });
+    } else {
+      job = loadGlobalLatest(panes.primary);
+    }
+    return job.then(function () {
+      if (url.split) return openSplit(url.split, { silent: true });
+      if (splitVisible()) closeSplit();
+      return null;
+    });
+  }
+
+  /* ---------- 实时同步：SSE + 轮询兜底 ---------- */
+
+  function showNewReplyBanner(ev) {
+    app.pendingBanner = { session_id: ev.session_id, reply_id: ev.reply_id, title: ev.title };
+    $('#new-reply-banner-text').textContent = '本会话有新回复' + (ev.title ? '：' + ev.title : '');
+    $('#new-reply-banner').hidden = false;
+  }
+
+  function switchToLatestReply() {
+    var pending = app.pendingBanner;
+    app.pendingBanner = null;
+    $('#new-reply-banner').hidden = true;
+    var sessionId = (pending && pending.session_id) || panes.primary.sessionId;
+    if (!sessionId) return refreshLatestNow();
+    closeDrawer();
+    panes.primary.viewingHistory = false;
+    return loadSessionReplies(sessionId, true).then(function (rows) {
+      var replyId = (rows[0] && rows[0].reply_id) || (pending && pending.reply_id);
+      if (!replyId) return refreshLatestNow();
+      return loadReply(panes.primary, sessionId, replyId);
+    });
+  }
+
+  function handleEvent(ev) {
+    if (!ev || typeof ev !== 'object') return;
+    var seq = Number(ev.seq || 0);
+    // SSE 与轮询可能同时送达同一条事件：按 seq 去重，避免重复 loadReply / 重复 toast
+    if (seq && seq <= app.lastHandledSeq) return;
+    if (seq) app.lastHandledSeq = seq;
+    if (seq > app.globalSeq) app.globalSeq = seq;
+    var sessionId = ev.session_id || '';
+    var primary = panes.primary;
+    if (!sessionId) {
+      refreshLatestNow();
+      return;
+    }
+
+    if (sessionId === primary.sessionId) {
+      if (drawerOpen() || primary.viewingHistory) {
+        // 阅读守卫：不打断抽屉 / 不替换正在回看的历史轮次
+        showNewReplyBanner(ev);
+        refreshSessions();
+        return;
+      }
+      markSeen(sessionId, seq);
+      loadReply(primary, sessionId, ev.reply_id, { noUrl: true }).then(function () {
+        writeUrl({ session: sessionId, reply: ev.reply_id });
+      });
+      refreshSessions();
+      return;
+    }
+
+    if (splitVisible() && sessionId === panes.secondary.sessionId) {
+      if (!panes.secondary.viewingHistory) {
+        loadReply(panes.secondary, sessionId, ev.reply_id, { noUrl: true });
+      }
+      refreshSessions();
+      return;
+    }
+
+    if (app.mode === 'global') {
+      loadReply(primary, sessionId, ev.reply_id, { noUrl: true }).then(function () {
+        writeUrl({ session: sessionId, reply: ev.reply_id, mode: 'global' });
+      });
+      refreshSessions();
+      return;
+    }
+
+    // 锁定当前会话：只标记未读 + 非侵入式提示，绝不劫持主窗格
+    toastAction('[' + (ev.session_label || sessionId) + ' · ' + (ev.title || '新回复') + ']', '查看', function () {
+      focusSession(sessionId, { reply: ev.reply_id });
+    });
+    refreshSessions();
+  }
+
+  function poll() {
+    if (app.polling) return Promise.resolve();
+    app.polling = true;
+    return fetchJSON('/api/state?since=' + app.globalSeq + '&_=' + Date.now()).then(function (data) {
+      setStatus('online', '已同步 ' + clock());
+      (data.events || []).forEach(handleEvent);
+      if (typeof data.seq === 'number' && data.seq > app.globalSeq) app.globalSeq = data.seq;
+      return refreshSessions();
+    }).catch(function () {
+      setStatus('offline', '连接中断，重试中');
+    }).then(function () {
+      app.polling = false;
+    });
+  }
+
+  function connectEvents() {
+    if (!('EventSource' in window) || app.sse) return;
+    try {
+      app.sse = new EventSource('/api/events');
+    } catch (err) {
+      app.sse = null;
+      return;
+    }
+    app.sse.addEventListener('open', function () {
+      setStatus('online', '实时已连接');
+    });
+    app.sse.addEventListener('reply', function (message) {
+      var payload = null;
+      try { payload = JSON.parse(message.data); } catch (err) { return; }
+      handleEvent(payload);
+    });
+    app.sse.addEventListener('error', function () {
+      setStatus('stale', '实时断线，轮询中');
+    });
+  }
+
+  /* ---------- 绑定与启动 ---------- */
+
   function bind() {
     $('#theme-btn').addEventListener('click', function () {
-      setTheme(state.theme === 'dark' ? 'light' : 'dark', true);
+      setTheme(app.theme === 'dark' ? 'light' : 'dark', true);
     });
     $('#history-select').addEventListener('change', function (ev) {
       loadHistory(ev.target.value);
@@ -1844,57 +2769,196 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       refreshLatestNow();
     });
     $('#drawer-close').addEventListener('click', closeDrawer);
+    $('#rail-toggle').addEventListener('click', toggleRail);
+    $('#mode-btn').addEventListener('click', function () {
+      app.mode = app.mode === 'lock' ? 'global' : 'lock';
+      writeUrl({ mode: app.mode });
+      updateModeButton();
+      toast(app.mode === 'lock' ? '已锁定当前会话：其它会话只提示，不跳转' : '已切换为跟随全局最新回复');
+    });
+    $('#rail-tabs').addEventListener('click', function (ev) {
+      var btn = ev.target.closest ? ev.target.closest('button[data-filter]') : null;
+      if (!btn) return;
+      app.filter = btn.dataset.filter;
+      $$('#rail-tabs button').forEach(function (b) { b.dataset.active = String(b === btn); });
+      renderRail();
+    });
+    $('#feed-btn').addEventListener('click', function () {
+      setRailView(app.railView === 'feed' ? 'sessions' : 'feed');
+    });
+    $('#new-reply-jump').addEventListener('click', switchToLatestReply);
+    $('#new-reply-dismiss').addEventListener('click', function () {
+      app.pendingBanner = null;
+      $('#new-reply-banner').hidden = true;
+    });
+    $('.sec-close').addEventListener('click', closeSplit);
+    $('.sec-session-select').addEventListener('change', function (ev) {
+      if (ev.target.value) openSplit(ev.target.value);
+    });
+    $('.sec-reply-select').addEventListener('change', function (ev) {
+      var sessionId = panes.secondary.sessionId;
+      if (!sessionId) return;
+      var rows = app.replies[sessionId] || [];
+      var replyId = ev.target.value || (rows[0] && rows[0].reply_id);
+      if (!replyId) return;
+      panes.secondary.viewingHistory = false;
+      loadReply(panes.secondary, sessionId, replyId, { noUrl: true });
+    });
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape') closeDrawer();
     });
-    canvasRoot.addEventListener('click', function (ev) {
-      var el = ev.target && ev.target.closest ? ev.target.closest('[data-drawer]') : null;
-      if (!el) return;
-      var payload = state.drawer[el.getAttribute('data-drawer')];
-      if (payload) openDrawer(payload);
-    });
-    canvasRoot.addEventListener('keydown', function (ev) {
-      if (ev.key !== 'Enter' && ev.key !== ' ') return;
-      var el = ev.target && ev.target.closest ? ev.target.closest('[data-drawer]') : null;
-      if (!el) return;
-      ev.preventDefault();
-      var payload = state.drawer[el.getAttribute('data-drawer')];
-      if (payload) openDrawer(payload);
+    [panes.primary, panes.secondary].forEach(function (pane) {
+      pane.el.addEventListener('click', function (ev) {
+        var el = ev.target && ev.target.closest ? ev.target.closest('[data-drawer]') : null;
+        if (!el) return;
+        var payload = pane.viewer.drawer[el.getAttribute('data-drawer')];
+        if (payload) openDrawer(payload);
+      });
+      pane.el.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return;
+        var el = ev.target && ev.target.closest ? ev.target.closest('[data-drawer]') : null;
+        if (!el) return;
+        ev.preventDefault();
+        var payload = pane.viewer.drawer[el.getAttribute('data-drawer')];
+        if (payload) openDrawer(payload);
+      });
     });
     window.addEventListener('resize', function () {
       clearTimeout(bind._t);
       bind._t = setTimeout(function () {
-        fitMindmap();
-        fitGraphs();
+        fitMindmap(panes.primary);
+        fitMindmap(panes.secondary);
+        fitGraphs(panes.primary);
+        fitGraphs(panes.secondary);
       }, 180);
     });
+    window.addEventListener('popstate', function () { applyUrl(); });
   }
 
   bind();
-  setTheme(state.theme, false);
-  setMode(state.mode);
-  rebuildViewSwitch();
-  applySubview();
-  poll();
-  setInterval(poll, 1000);
+  setTheme(app.theme, false);
+  updateModeButton();
+  if (localStorage.getItem('vr.rail') === '0') $('#session-rail').dataset.open = 'false';
+  setMode(panes.primary, 'md');
+  setMode(panes.secondary, 'md');
+  applySubview(panes.primary);
+  applySubview(panes.secondary);
+  renderRail();
+  refreshSessions().then(function () { return applyUrl(); }).then(function () {
+    // 初始状态已通过 refreshSessions()/applyUrl() 对齐，之后的事件才需要逐条处理
+    app.lastHandledSeq = app.globalSeq;
+    connectEvents();
+    poll();
+    setInterval(poll, 3000);
+  });
 })();
 </script>
 </body>
 </html>
 """
 
-
 def iso_time(ts: float) -> str:
     return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
 
 
+class SSEBroker:
+    """极简 stdlib SSE 广播：后台 watcher 兜底，/api/notify 立即唤醒。"""
+
+    def __init__(self, cache_dir: Path, limit: int = SSE_CLIENTS) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.stop_event = threading.Event()
+        self.slots = threading.Semaphore(limit)
+        self._clients: set[queue.Queue] = set()
+        self._lock = threading.Lock()
+        self._sent_seq = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._sent_seq = int(vr_store.read_state(self.cache_dir).get("seq") or 0)
+        self._thread = threading.Thread(target=self._watch, name="vr-sse-watch", daemon=True)
+        self._thread.start()
+
+    def _watch(self) -> None:
+        """state.json 的 seq 变了就推事件，即使写入方没有调用 /api/notify。"""
+        while not self.stop_event.wait(SSE_POLL):
+            try:
+                state = vr_store.read_state(self.cache_dir)
+            except OSError:
+                continue
+            seq = int(state.get("seq") or 0)
+            if seq <= self._sent_seq:
+                continue
+            session_id = state.get("latest_session_id") or ""
+            reply_id = state.get("latest_reply_id") or ""
+            if not session_id or not reply_id:
+                self._sent_seq = seq
+                continue
+            self.push(vr_store.reply_event(self.cache_dir, session_id, reply_id))
+
+    def push(self, payload: dict) -> None:
+        event = dict(payload)
+        try:
+            seq = int(event.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        with self._lock:
+            if seq:
+                self._sent_seq = max(self._sent_seq, seq)
+            clients = list(self._clients)
+        for client in clients:
+            try:
+                client.put_nowait(event)
+            except queue.Full:
+                # 慢客户端：丢最旧的一条，保证仍能收到最新状态
+                try:
+                    client.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    client.put_nowait(event)
+                except queue.Full:
+                    pass
+
+    def register(self) -> queue.Queue | None:
+        if not self.slots.acquire(blocking=False):
+            return None
+        client: queue.Queue = queue.Queue(maxsize=SSE_QUEUE)
+        with self._lock:
+            self._clients.add(client)
+        return client
+
+    def unregister(self, client: queue.Queue) -> None:
+        with self._lock:
+            if client in self._clients:
+                self._clients.discard(client)
+                self.slots.release()
+
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self._lock:
+            clients = list(self._clients)
+        for client in clients:
+            try:
+                client.put_nowait(None)
+            except queue.Full:
+                pass
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VisualReply/2.0"
+    server_version = "VisualReply/4.0"
     protocol_version = "HTTP/1.1"
 
     cache_dir: Path = DEFAULT_CACHE_DIR
 
     # ---------- 输出工具 ----------
+
+    @property
+    def broker(self) -> SSEBroker:
+        return self.server.broker
 
     def _send(self, status: int, body: bytes, ctype: str) -> None:
         self.send_response(status)
@@ -1916,6 +2980,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _error(self, status: int, message: str) -> None:
         self._json({"ok": False, "error": message, "status": status}, status)
+
+    def _read_body(self) -> bytes | None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length < 0 or length > 4 * 1024 * 1024:
+            return None
+        if length == 0:
+            return b""
+        try:
+            return self.rfile.read(length)
+        except OSError:
+            return None
 
     # ---------- 数据读取 ----------
 
@@ -2008,28 +3086,23 @@ class Handler(BaseHTTPRequestHandler):
             "content": content,
             "mtime": mtime,
             "updated_at": iso_time(mtime),
+            "seq": int(meta.get("seq") or 0),
+            "session_id": meta.get("session_id") or "",
+            "reply_id": meta.get("reply_id") or "",
         }
 
     def _history_files(self) -> list[Path]:
-        hist = self.cache_dir / "history"
-        if not hist.is_dir():
-            return []
-        files = []
-        for path in hist.iterdir():
-            if not path.is_file():
-                continue
-            name = path.name
-            if name.endswith(".meta.json"):
-                continue
-            fmt = EXT_FORMAT.get(path.suffix.lower())
-            if fmt is None:
-                continue
-            # 旧版 `.md` 归档的标题 sidecar 是同名 `.json`，跳过它
-            if fmt == "json" and path.with_suffix(".md").is_file():
-                continue
-            files.append(path)
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        files = vr_store.legacy_history_files(self.cache_dir)
         return files[:HISTORY_LIMIT]
+
+    def _legacy_only_history_files(self) -> list[Path]:
+        """真正的 v3 遗留归档：sidecar 里没有 reply_id 的历史文件。"""
+        files = []
+        for path in vr_store.legacy_history_files(self.cache_dir):
+            sidecar = self._sidecar_meta(path)
+            if not sidecar.get("reply_id"):
+                files.append(path)
+        return files
 
     def _sidecar_meta(self, path: Path) -> dict:
         candidates = [path.with_name(path.name + ".meta.json")]
@@ -2074,6 +3147,9 @@ class Handler(BaseHTTPRequestHandler):
             "mtime": st.st_mtime if st else 0,
             "updated_at": updated_at,
             "size": st.st_size if st else 0,
+            "seq": int(sidecar.get("seq") or 0),
+            "session_id": sidecar.get("session_id") or "",
+            "reply_id": sidecar.get("reply_id") or "",
         }
 
     @staticmethod
@@ -2109,13 +3185,113 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return target
 
+    # ---------- 会话接口 ----------
+
+    def _sessions_payload(self) -> dict:
+        state = vr_store.read_state(self.cache_dir)
+        sessions = vr_store.list_sessions(self.cache_dir)
+        legacy = len(self._legacy_only_history_files())
+        return {
+            "version": VERSION,
+            "seq": state["seq"],
+            "latest_session_id": state["latest_session_id"],
+            "latest_reply_id": state["latest_reply_id"],
+            "sessions": sessions,
+            "count": len(sessions),
+            "legacy_count": legacy,
+        }
+
+    def _feed_payload(self, limit: int) -> dict:
+        items = vr_store.feed_items(self.cache_dir, limit)
+        legacy_items: list[dict] = []
+        remaining = max(0, limit - len(items))
+        if remaining:
+            for path in self._legacy_only_history_files()[:remaining]:
+                item = self._history_item(path)
+                legacy_items.append({
+                    "seq": int(item.get("seq") or 0),
+                    "session_id": item.get("session_id") or "",
+                    "session_label": "历史归档",
+                    "client": "",
+                    "project": "",
+                    "reply_id": item.get("reply_id") or "",
+                    "filename": item.get("filename"),
+                    "format": item.get("format"),
+                    "title": item.get("title"),
+                    "chars": item.get("size") or 0,
+                    "updated_at": item.get("updated_at"),
+                    "legacy": True,
+                })
+        merged = items + legacy_items
+        return {
+            "version": VERSION,
+            "items": merged,
+            "count": len(merged),
+            "legacy_count": len(legacy_items),
+        }
+
+    def _state_payload(self, since: int) -> dict:
+        state = vr_store.read_state(self.cache_dir)
+        events = vr_store.state_events(self.cache_dir, since, limit=200)
+        return {
+            "version": VERSION,
+            "seq": state["seq"],
+            "events": events,
+            "latest_session_id": state["latest_session_id"],
+            "latest_reply_id": state["latest_reply_id"],
+        }
+
+    # ---------- SSE ----------
+
+    def _sse(self) -> None:
+        broker = self.broker
+        client = broker.register()
+        if client is None:
+            self._error(503, "SSE 客户端已达上限")
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.close_connection = True
+            self.wfile.write(b": connected\n\n")
+            self.wfile.write(b"retry: 1500\n\n")
+            self.wfile.flush()
+            while not broker.stop_event.is_set():
+                try:
+                    event = client.get(timeout=SSE_KEEPALIVE)
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                if event is None:
+                    break
+                frame = (
+                    "id: " + str(int(event.get("seq") or 0)) + "\n"
+                    "event: reply\n"
+                    "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+                ).encode("utf-8")
+                self.wfile.write(frame)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            broker.unregister(client)
+
     # ---------- 路由 ----------
+
+    def _segments(self, path: str) -> list[str]:
+        return [unquote(part) for part in path.split("/") if part]
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path or "/"
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
+        query = parse_qs(parsed.query)
 
         if path == "/":
             self._send(200, PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8")
@@ -2124,10 +3300,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(204, b"", "image/x-icon")
             return
         if path == "/healthz":
+            broker = self.server.broker
             self._json({"ok": True, "service": SERVICE_NAME, "version": VERSION,
                         "pid": os.getpid(),
                         "port": self.server.server_address[1],
-                        "cache_dir": str(self.cache_dir)})
+                        "cache_dir": str(self.cache_dir),
+                        "seq": vr_store.read_state(self.cache_dir)["seq"],
+                        "sse_clients": broker.client_count() if broker else 0})
             return
         if path == "/api/latest":
             self._json(self._latest())
@@ -2135,6 +3314,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/history":
             items = [self._history_item(p) for p in self._history_files()]
             self._json({"version": VERSION, "items": items, "count": len(items)})
+            return
+        if path == "/api/sessions":
+            self._json(self._sessions_payload())
+            return
+        if path == "/api/feed":
+            try:
+                limit = int((query.get("limit") or [str(FEED_LIMIT)])[0])
+            except (TypeError, ValueError):
+                limit = FEED_LIMIT
+            limit = max(1, min(limit, 500))
+            self._json(self._feed_payload(limit))
+            return
+        if path == "/api/state":
+            try:
+                since = int((query.get("since") or ["0"])[0])
+            except (TypeError, ValueError):
+                self._error(400, "since 必须是整数")
+                return
+            self._json(self._state_payload(max(0, since)))
+            return
+        if path == "/api/events":
+            self._sse()
             return
         if path.startswith("/api/history/"):
             raw = unquote(path[len("/api/history/"):])
@@ -2152,6 +3353,64 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(500, f"读取失败: {exc}")
                 return
             self._json(item)
+            return
+        if path.startswith("/artifact/session/"):
+            parts = self._segments(path)
+            if len(parts) != 4 or parts[0] != "artifact" or parts[1] != "session":
+                self._error(404, "HTML Artifact 不存在")
+                return
+            session_id, reply_id = parts[2], parts[3]
+            if not vr_store.is_safe_id(session_id) or not vr_store.is_safe_id(reply_id):
+                self._error(400, "非法的会话或回复 ID")
+                return
+            meta = vr_store.read_reply_meta(self.cache_dir, session_id, reply_id)
+            target = vr_store.reply_file(self.cache_dir, session_id, reply_id)
+            if meta is None or target is None or target.suffix.lower() != ".html":
+                self._error(404, "HTML Artifact 不存在")
+                return
+            try:
+                body = target.read_bytes()
+            except OSError as exc:
+                self._error(500, f"读取失败: {exc}")
+                return
+            self._send(200, body, "text/html; charset=utf-8")
+            return
+        if path.startswith("/api/sessions/"):
+            parts = self._segments(path)
+            if len(parts) < 3 or parts[0] != "api" or parts[1] != "sessions":
+                self._error(404, "未找到该路径")
+                return
+            session_id = parts[2]
+            if not vr_store.is_safe_id(session_id):
+                self._error(400, "非法的会话 ID")
+                return
+            session = vr_store.read_session(self.cache_dir, session_id)
+            if session is None:
+                self._error(404, "会话不存在")
+                return
+            if len(parts) == 4 and parts[3] == "replies":
+                try:
+                    limit = int((query.get("limit") or [str(REPLY_LIMIT)])[0])
+                except (TypeError, ValueError):
+                    limit = REPLY_LIMIT
+                limit = max(1, min(limit, 1000))
+                replies = vr_store.list_replies(self.cache_dir, session_id, limit)
+                self._json({"version": VERSION, "session": session,
+                            "replies": replies, "count": len(replies)})
+                return
+            if len(parts) == 5 and parts[3] == "replies":
+                reply_id = parts[4]
+                if not vr_store.is_safe_id(reply_id):
+                    self._error(400, "非法的回复 ID")
+                    return
+                data = vr_store.read_reply(self.cache_dir, session_id, reply_id)
+                if data is None:
+                    self._error(404, "回复不存在")
+                    return
+                self._json({"version": VERSION, "session": session,
+                            "reply": data["reply"], "content": data["content"]})
+                return
+            self._error(404, "未找到该路径")
             return
         if path == "/artifact/latest":
             target = self._artifact_payload(None)
@@ -2184,6 +3443,65 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
 
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = parsed.path or "/"
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+
+        body = self._read_body()
+        if body is None:
+            self._error(400, "请求体缺失或过大")
+            return
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            self._error(400, "JSON 解析失败")
+            return
+        if not isinstance(payload, dict):
+            self._error(400, "请求体必须是 JSON 对象")
+            return
+
+        if path == "/api/notify":
+            self.broker.push(payload)
+            self._json({"ok": True, "version": VERSION})
+            return
+
+        parts = self._segments(path)
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "sessions":
+            session_id = parts[2]
+            if not vr_store.is_safe_id(session_id):
+                self._error(400, "非法的会话 ID")
+                return
+            label = payload.get("label")
+            pinned = payload.get("pinned")
+            if label is not None and not isinstance(label, str):
+                self._error(400, "label 必须是字符串")
+                return
+            if pinned is not None and not isinstance(pinned, bool):
+                self._error(400, "pinned 必须是布尔值")
+                return
+            if label is None and pinned is None:
+                self._error(400, "没有可更新的字段（label / pinned）")
+                return
+            try:
+                with vr_store.cache_lock(self.cache_dir):
+                    record = vr_store.update_session(self.cache_dir, session_id,
+                                                     label=label, pinned=pinned)
+            except vr_store.LockTimeout:
+                self._error(503, "缓存目录正忙，请稍后重试")
+                return
+            except OSError as exc:
+                self._error(500, f"写入失败: {exc}")
+                return
+            if record is None:
+                self._error(404, "会话不存在")
+                return
+            self._json({"ok": True, "version": VERSION, "session": record})
+            return
+
+        self._error(404, "未找到该路径")
+
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
 
@@ -2194,10 +3512,13 @@ class Handler(BaseHTTPRequestHandler):
 class VisualReplyServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    #: 多 Agent 会同时发布 / 轮询，默认 backlog=5 会丢 SYN（客户端要等 1s 重传）
+    request_queue_size = 128
+    broker: SSEBroker | None = None
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="visual-reply 本地预览服务")
+    parser = argparse.ArgumentParser(description="visual-reply 本地预览服务（多会话工作台）")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"监听端口（默认 {DEFAULT_PORT}）")
@@ -2210,9 +3531,12 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cache_dir = Path(args.cache_dir).expanduser().resolve()
     (cache_dir / "history").mkdir(parents=True, exist_ok=True)
+    (cache_dir / "sessions").mkdir(parents=True, exist_ok=True)
 
+    broker = SSEBroker(cache_dir)
     handler = type("BoundHandler", (Handler,), {"cache_dir": cache_dir})
     httpd = VisualReplyServer((args.host, args.port), handler)
+    httpd.broker = broker
     port = httpd.server_address[1]
 
     pid_file = cache_dir / f".server-{port}.json"
@@ -2235,16 +3559,20 @@ def main(argv=None) -> int:
             pass
 
     def stop(_signum, _frame) -> None:
+        # 先放 SSE 处理器退出，再关闭 serve_forever；daemon 线程保证毫秒级退出
+        broker.stop()
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    broker.start()
     print(f"{SERVICE_NAME} v{VERSION} listening on http://{args.host}:{port} (cache={cache_dir})",
           file=sys.stderr, flush=True)
     try:
         httpd.serve_forever(poll_interval=0.2)
     finally:
+        broker.stop()
         httpd.server_close()
         cleanup()
     return 0

@@ -9,6 +9,7 @@
 Visual Reply 是一个面向终端 / CLI 编码 Agent 的 Skill。它不再把六百字的答案倾倒进
 scrollback，而是把结构化载荷发布到 `http://127.0.0.1:18765`，终端里只留一句结论和一个链接。
 图表、拓扑图和评分卡在浏览器里渲染，所有长解释默认折叠进右侧抽屉，点开才展开。
+同时开几个 Agent 也不打架：每个会话在同一个页面里各占一条泳道。
 
 只依赖 Python 3.10+ 标准库。不需要 pip 安装，不需要 API Key，不上报任何数据，自身也不发起网络请求。
 
@@ -70,15 +71,36 @@ Visual Reply 强制两级信息密度：**首屏不出现长句**——只有数
 每个节点、卡片、步骤都可以带 `details`（Markdown）和 `files`（等宽 chip）。点击后在右侧
 Inspector 抽屉里展开完整说明、代码块和文件清单；`Esc` 或 `×` 关闭。鼠标悬停节点会高亮其上下游连线。
 
-### 1 秒无刷热更新
+### 多会话工作台
 
-页面每秒轮询一次 `mtime`。再次发布到同一端口和同一缓存目录时，已打开的标签页会就地刷新，
-不用手动 reload，也不会跳走滚动位置。
+每条回复都会归到某个会话，零配置推导：`--session` → `VISUAL_REPLY_SESSION` → 客户端线程变量
+（`ANTIGRAVITY_CONVERSATION_ID`、`CODEX_THREAD_ID`、`OPENCODE_SESSION_ID`、
+`GEMINI_SESSION_ID`、`CLAUDE_SESSION_ID`）→ 终端复用器面板（`WT_SESSION`、`TMUX_PANE`、
+`WEZTERM_PANE`、`KITTY_WINDOW_ID`、`ITERM_SESSION_ID`）→ 父进程 + 项目根的哈希。
+同一个 shell 稳定落在一个会话，换个终端自然分开。
+
+- **左侧会话栏**：置顶优先、其后按最近发布排序。卡片有色条、客户端徽标、最新标题、时间与未读角标；
+  顶部可筛 `全部 / 未读 / 置顶`，底部 `全局时间线` 汇总所有会话。
+- **焦点锁（聚焦会话后的默认行为）**：点开会话或打开 `?session=` 深链后即锁定该会话。别的会话来新
+  回复时**不会**抢占你正在读的窗格，只把左侧标未读并弹一个可点击的小提示。想看全局最新，点顶部切到
+  `跟随全局`。
+- **阅读守卫**：即使在当前会话内，只要 Inspector 抽屉开着、或正在回看历史轮次，新回复也只在顶部
+  显示横幅「本会话有新回复 [切到最新]」，不关抽屉、不替换正在读的内容。
+- **分屏**：会话卡片上的 `◫` 打开第二窗格。两个窗格各自保留会话、视图模式与回复轮次，共用一个抽屉。
+- **回复轮次**：历史下拉列出当前会话的每一轮（`#3 (最新) · 标题`、`#2 · 标题`……），另附 v3 归档。
+
+深链：`?session=<sid>&reply=<rid>`，可选 `&split=<sid2>`、`&layout=h|v`、`&mode=lock|global`。
+发布回执里的 `url` 本身就是这样一条深链。
+
+### 实时无刷更新
+
+`publish.py` 提交后会 `POST /api/notify`，打开着的标签页通过 SSE 在 100ms 级刷新。
+SSE 断线时自动降级为 3 秒 `/api/state?since=` 轮询，两者都不会手动 reload，也不会跳走滚动位置。
 
 ### 其他
 
 - 浅色 / 深色主题切换，按浏览器记忆。
-- 最近 20 次发布在本地归档，从历史下拉框随时回看。
+- 每次发布都按会话归档，同时投影出 v3 的 `history/`，历史下拉随时回看（最近 20 条）。
 - 端口上若跑着旧版本服务，会自动 `SIGTERM` 接管并拉起当前版本。
 - 服务只监听 `127.0.0.1`。
 - 发布时顺带做长度检查：`headline` 或 `edge.label` 超长会在返回 JSON 里多一个 `warnings`
@@ -95,18 +117,21 @@ flowchart LR
     C -->|"对象含<br/>sections / nodes / cards"| D["Visual Canvas"]
     C -->|"doctype · html · svg"| E["HTML Artifact"]
     C -->|"其余"| F["Markdown"]
-    B --> G[("缓存目录<br/>latest.ext · meta.json<br/>history/")]
+    B --> G[("缓存目录<br/>sessions/SID/replies<br/>state.json · feed.jsonl<br/>latest.ext · history/")]
     G --> H["server.py<br/>127.0.0.1:18765"]
     D --> H
     E --> H
     F --> H
     H --> I["浏览器"]
-    I -.->|"每 1 秒轮询 mtime"| H
+    B -.->|"POST /api/notify"| H
+    H -.->|"SSE 回复事件"| I
+    I -.->|"3 秒 /api/state 兜底轮询"| H
 ```
 
-`publish.py` 是唯一的写入方：校验载荷、原子写入 `latest.<ext>` 与 `meta.json`、在 `history/`
-下归档一份、端口空闲时后台拉起 `server.py`，最后输出 JSON 回执。`server.py` 除缓存目录外无状态，
-随时可以重启。
+`publish.py` 是唯一的写入方：解析会话 → 在 `.publish.lock` 上加排他锁 → 把回复写进
+`sessions/<sid>/replies/` → 更新 `state.json` 与 `global/feed.jsonl` → 同步投影出 v3 的
+`latest.<ext>` / `meta.json` / `history/` → 端口空闲时后台拉起 `server.py` → 唤醒 SSE。
+`server.py` 除缓存目录外无状态，随时可以重启。
 
 ---
 
@@ -168,20 +193,24 @@ mklink /D "%USERPROFILE%\.claude\skills\visual-reply" "%USERPROFILE%\src\visual-
 echo '{"headline":"采用方案 B：改动 12 个文件，不新增依赖","sections":[{"type":"kpis","items":[{"label":"改动文件","value":"12","status":"ok"},{"label":"新增依赖","value":"0","status":"ok"},{"label":"回滚耗时","value":"90s","status":"warn"}]},{"type":"comparison","title":"方案对比","items":[{"name":"方案 A：新建服务","scores":{"速度":2,"风险":4},"cons":["多一个部署目标"]},{"name":"方案 B：扩展中台","badge":"推荐","recommended":true,"scores":{"速度":4,"风险":2},"pros":["不新增部署目标"]}]}]}' | python3 scripts/publish.py --title "采用方案 B" --stdin
 ```
 
-终端会收到这样的回执：
+终端会收到这样的回执（已截断）：
 
 ```json
 {
   "ok": true,
   "format": "json",
   "title": "采用方案 B",
-  "url": "http://127.0.0.1:18765",
+  "url": "http://127.0.0.1:18765/?session=codex-7f3a&reply=20260101-120000-000001-B",
+  "session_id": "codex-7f3a",
+  "reply_id": "20260101-120000-000001-B",
+  "seq": 1,
+  "session_url": "http://127.0.0.1:18765/?session=codex-7f3a",
   "server": "started",
   "browser": "xdg-open"
 }
 ```
 
-再发布一次，已打开的页面会在一秒内自动更新。
+再发布一次，已打开的页面会就地更新，通常在 100ms 级。
 
 其他入口：
 
@@ -260,19 +289,34 @@ python3 scripts/server.py --port 18765
 | `--no-browser` | 不自动打开浏览器 |
 | `--port` | 服务端口，默认 `18765` |
 | `--cache-dir` | 缓存目录，默认 `~/.cache/agent-visual-reply` |
+| `--session` | 会话 ID，显式指定后跳过自动检测；非法 ID 直接拒绝 |
+| `--session-name` | 会话显示名，持久化到 `session.json` |
+| `--agent` | 客户端徽标（`codex` / `claude` / `antigravity` …） |
 
 缓存结构：
 
 ```text
 ~/.cache/agent-visual-reply/
-├── latest.json | latest.html | latest.md   # 按格式只写其一
-├── meta.json                               # version / format / title / mtime / chars
+├── .publish.lock                          # 写锁：跨平台排他锁（flock / msvcrt.locking）
+├── .server.lock                           # 启动锁：冷启动串行化
+├── state.json                             # version / seq / 最新会话与回复指针
+├── sessions/
+│   └── <sid>/
+│       ├── session.json                   # label / client / project / pinned / seq / reply_count
+│       └── replies/
+│           ├── 20260101-120000-000001-标题.md
+│           └── 20260101-120000-000001-标题.md.meta.json
+├── global/feed.jsonl                      # 追加式跨会话时间线
+├── latest.json | latest.html | latest.md  # v3 投影，按格式只写其一
+├── meta.json                              # v3 投影，额外带 seq / session_id / reply_id
 ├── server.log
-└── history/
+└── history/                               # v3 投影，旧客户端照常读
     ├── 20260101-120000-标题.json
-    ├── 20260101-120000-标题.json.meta.json  # 独立 sidecar，不与载荷冲突
+    ├── 20260101-120000-标题.json.meta.json
     └── 20260101-090000-旧内容.md
 ```
+
+`reply_id` 形如 `<时间戳>-<seq:06d>-<ASCII 片段>`：可排序、并发下唯一、可直接拼进 URL。
 
 ---
 
@@ -286,7 +330,16 @@ python3 scripts/server.py --port 18765
 | `GET /api/history/<filename>` | `{format, title, content, updated_at, mtime}` |
 | `GET /artifact/latest` | 当前 HTML Artifact 原文，`text/html; charset=utf-8`；非 html 格式返回 404 |
 | `GET /artifact/history/<filename>` | 历史 HTML Artifact 原文 |
-| `GET /healthz` | `{ok, service, version, pid, port, cache_dir}` |
+| `GET /api/sessions` | `{version, seq, latest_session_id, sessions, legacy_count}`，置顶优先、其后按新到旧 |
+| `GET /api/sessions/<sid>/replies?limit=200` | 某会话的回复轮次，最新在前 |
+| `GET /api/sessions/<sid>/replies/<rid>` | `{version, session, reply, content}` |
+| `GET /api/feed?limit=50` | 跨会话全局时间线（含未归入会话的 v3 归档） |
+| `GET /api/state?since=<seq>` | 断线补播的增量事件 |
+| `GET /api/events` | SSE 流（`text/event-stream`，20 秒 keepalive） |
+| `POST /api/notify` | 发布后立即唤醒 SSE |
+| `POST /api/sessions/<sid>` | 原子更新 `{label, pinned}` |
+| `GET /artifact/session/<sid>/<rid>` | 会话回复的 HTML 原文 |
+| `GET /healthz` | `{ok, service, version, pid, port, cache_dir, seq}` |
 
 ---
 
@@ -300,6 +353,11 @@ python3 scripts/test_visual_reply.py
 五类组件元数据、前端组件存在性、artifact 接口、混合格式历史排序、路径穿越防护、旧版服务接管、
 长度提醒，以及开源卫生扫描。装好 `node` 时，还会用页面里的纯几何核心跑一张六列回环拓扑，
 断言越界、穿模、列间距与标签叠字。
+
+v4 追加：所有会话识别来源与深链回执格式；8 进程并发跨 3 个会话发布（全部退出 0、零丢回复、
+seq `1..8`、sidecar 全可解析）；SSE 连接 → 2 秒内实时推送 → `/api/state` 补播 →
+挂着客户端 `SIGTERM` 1.5 秒内退出；会话置顶/重命名与 `/api/sessions/..`、`/artifact/session/..`
+穿越拒绝；以及工作台每个渲染器「只有一份实现」的结构断言。
 
 不需要联网。
 
@@ -317,6 +375,9 @@ python3 scripts/test_visual_reply.py
 | 宽图右侧看不全 | 点拓扑图右上角「适应」按容器宽度缩放（最低 0.35×） |
 | 图表 / 脑图不显示 | Markdown 模式从 jsDelivr 加载 `marked`、`mermaid`、`markmap`，离线时退化为纯文本；JSON 画布除抽屉内 Markdown 外不依赖 CDN |
 | 改了内容但页面没变 | 确认端口与 `--cache-dir` 一致；右上角状态点应显示「已同步」 |
+| 新回复没有自动出现 | 状态点显示「实时断线」时说明 SSE 被挡，3 秒轮询会自动接管 |
+| 一个 Agent 变成好几个会话 | 父进程或终端面板变了；用 `--session` / `--session-name` 固定 |
+| 发布跑到别的会话里 | 环境里残留了 `CODEX_THREAD_ID`、`CLAUDE_SESSION_ID` 等；`--session` 永远优先 |
 
 ---
 

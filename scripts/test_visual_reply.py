@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""visual-reply v2 端到端自动化测试。
+"""visual-reply v4 端到端自动化测试。
 
 覆盖：
     md / json / html 三种载荷、auto 自动识别、五种画布组件元数据、
     前端 PAGE_HTML 组件存在性、artifact 接口、混合历史、路径穿越防护、
     旧版服务接管升级、复杂 6 列回环拓扑的 JS 几何断言、发布长度提醒，
-    以及开源卫生检查（隐私路径、文档互链、.gitignore、CI 配置、跨平台打开浏览器）。
+    多会话识别与深链回执、多进程并发写入、SSE 实时推送与快速退出、
+    会话置顶/重命名与安全校验，以及开源卫生检查。
 
 使用临时目录与随机可用端口，不触碰真实缓存目录；测试结束后关闭服务并清理。
 
@@ -14,9 +15,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import http.client as http_client
 import importlib.util
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -28,11 +32,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PUBLISH = SCRIPT_DIR / "publish.py"
 SERVER = SCRIPT_DIR / "server.py"
+STORE = SCRIPT_DIR / "vr_store.py"
 SKILL_MD = SCRIPT_DIR.parent / "SKILL.md"
 
 PASSED = 0
@@ -62,10 +68,35 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  [FAIL] {name}" + (f" -> {detail}" if detail else ""))
 
 
+#: 测试端口刻意避开系统 ephemeral 端口段。若服务端口落在该段内，客户端随机源端口
+#: 可能与目标端口相同，在 Linux 上会形成 TCP self-connect：SYN 回到客户端自己的
+#: socket，服务端永远收不到请求，表现为「连接超时」。18000-32000 在 Linux/macOS/
+#: Windows 上都位于 ephemeral 段之外。
+PORT_LOW, PORT_HIGH = 18000, 32000
+
+
 def free_port() -> int:
+    for _ in range(300):
+        candidate = random.randint(PORT_LOW, PORT_HIGH)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+        return candidate
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def unique_port(taken: set[int]) -> int:
+    """free_port 可能连续返回同一个端口，测试内必须去重。"""
+    for _ in range(50):
+        candidate = free_port()
+        if candidate not in taken:
+            taken.add(candidate)
+            return candidate
+    raise RuntimeError("无法分配不重复的测试端口")
 
 
 def port_open(port: int) -> bool:
@@ -83,10 +114,26 @@ def wait_port_closed(port: int, timeout: float = 8.0) -> bool:
     return not port_open(port)
 
 
-def http(url: str):
-    req = urllib.request.Request(url, headers={"Accept": "*/*"})
-    with urllib.request.urlopen(req, timeout=6) as resp:
-        return resp.status, resp.read(), resp.headers
+def http(url: str, attempts: int = 2):
+    """带一次重试的 GET。
+
+    WSL 的 loopback 偶发丢 SYN：connect 会卡到 7s 才失败，而服务端日志里根本没有这条
+    请求。这属于宿主网络栈问题，不是服务端错误，幂等 GET 重试一次即可。
+    """
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        req = urllib.request.Request(url, headers={"Accept": "*/*"})
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return resp.status, resp.read(), resp.headers
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, socket.timeout, ConnectionError) as exc:
+            last_error = exc
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.2)
+    raise last_error  # pragma: no cover - 循环必然 return 或 raise
 
 
 def get_json(url: str):
@@ -434,16 +481,101 @@ httpd.serve_forever()
 '''
 
 
-def publish(port: int, cache: Path, content: str, title: str, fmt: str = "auto") -> tuple[int, dict]:
+SESSION_ENV_KEYS = (
+    "VISUAL_REPLY_SESSION",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "ANTIGRAVITY_PROJECT_ID",
+    "ANTIGRAVITY_AGENT",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "OPENCODE_SESSION_ID",
+    "GEMINI_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CLAUDE_CODE_REPL_ID",
+    "WT_SESSION",
+    "TMUX_PANE",
+    "WEZTERM_PANE",
+    "KITTY_WINDOW_ID",
+    "ITERM_SESSION_ID",
+)
+
+
+def clean_env(**extra) -> dict:
+    """去掉宿主可能残留的会话变量，保证自动检测结果可预期。"""
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_ENV_KEYS}
+    env.update({k: str(v) for k, v in extra.items()})
+    return env
+
+
+def detect_project_root(start: Path) -> Path:
+    current = start.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            return start.resolve()
+        current = current.parent
+
+
+def raw_request(port: int, method: str, path: str,
+                body: bytes | str | None = None,
+                headers: dict | None = None) -> tuple[int, bytes, dict]:
+    """用 http.client 直发原始路径，绕过客户端对 ../ 的归一化。"""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    conn = http_client.HTTPConnection("127.0.0.1", port, timeout=8)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        return resp.status, data, dict(resp.getheaders())
+    finally:
+        conn.close()
+
+
+def sse_connect(port: int, timeout: float = 6.0) -> socket.socket:
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    except OSError:
+        time.sleep(0.2)
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    request = (
+        f"GET /api/events HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        f"Accept: text/event-stream\r\n\r\n"
+    )
+    sock.sendall(request.encode("ascii"))
+    return sock
+
+
+def read_until(sock: socket.socket, needle: bytes, deadline: float) -> bytes:
+    buffer = b""
+    while needle not in buffer and time.time() < deadline:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buffer += chunk
+    return buffer
+
+
+def publish(port: int, cache: Path, content: str, title: str, fmt: str = "auto",
+            env: dict | None = None, extra: list[str] | None = None) -> tuple[int, dict]:
+    cmd = [sys.executable, str(PUBLISH),
+           "--title", title, "--stdin", "--no-browser",
+           "--format", fmt,
+           "--port", str(port), "--cache-dir", str(cache)]
+    if extra:
+        cmd.extend(extra)
     proc = subprocess.run(
-        [sys.executable, str(PUBLISH),
-         "--title", title, "--stdin", "--no-browser",
-         "--format", fmt,
-         "--port", str(port), "--cache-dir", str(cache)],
+        cmd,
         input=content.encode("utf-8"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=50,
+        timeout=60,
+        env=env if env is not None else clean_env(),
     )
     out = proc.stdout.decode("utf-8", errors="replace").strip()
     try:
@@ -481,14 +613,22 @@ def wait_for(predicate, timeout: float = 10.0) -> bool:
 
 def main() -> int:
     cache = Path(tempfile.mkdtemp(prefix="vr-test-")).resolve()
-    port = free_port()
     cache_v1 = Path(tempfile.mkdtemp(prefix="vr-test-v1-")).resolve()
-    port_v1 = free_port()
     geo_dir = Path(tempfile.mkdtemp(prefix="vr-geo-")).resolve()
+    stress_cache = Path(tempfile.mkdtemp(prefix="vr-stress-")).resolve()
+    cold_cache = Path(tempfile.mkdtemp(prefix="vr-cold-")).resolve()
+    used_ports: set[int] = set()
+    port = unique_port(used_ports)
+    port_v1 = unique_port(used_ports)
+    stress_port = unique_port(used_ports)
+    cold_port = unique_port(used_ports)
     print(f"临时目录: {cache}")
     print(f"测试端口: {port}")
+    print(f"并发测试: {stress_cache} @ {stress_port}")
+    print(f"冷启动测试: {cold_cache} @ {cold_port}")
 
     fake_proc = None
+    stress_proc = None
 
     try:
         # ---------- 1. md 发布（auto 识别） ----------
@@ -528,7 +668,7 @@ def main() -> int:
             check(f"页面包含视图按钮 {view}", view in page)
         check("页面包含暗色主题样式", 'html[data-theme="dark"]' in page)
         check("页面包含历史下拉", 'id="history-select"' in page)
-        check("页面包含轮询逻辑", "setInterval(poll, 1000)" in page)
+        check("页面包含轮询兜底逻辑", "setInterval(poll, 3000)" in page)
         check("折叠样式会隐藏区块内容", ".sec.collapsed > .sec-body { display: none; }" in page)
         check("页面包含回到最新逻辑", "function refreshLatestNow" in page)
 
@@ -782,14 +922,15 @@ def main() -> int:
         check(f"报告 server_version == {EXPECTED_VERSION}", data.get("server_version") == EXPECTED_VERSION,
               str(data.get("server_version")))
 
-        def v2_up() -> bool:
+        def current_up() -> bool:
             try:
                 _, info = get_json(f"http://127.0.0.1:{port_v1}/healthz")
                 return info.get("version") == EXPECTED_VERSION
             except Exception:
                 return False
 
-        check("端口上运行的是 v2 服务", wait_for(v2_up, 10), "v2 未接管端口")
+        check(f"端口上运行的是 v{EXPECTED_VERSION} 服务",
+              wait_for(current_up, 10), f"v{EXPECTED_VERSION} 未接管端口")
         _, info = get_json(f"http://127.0.0.1:{port_v1}/healthz")
         check(f"接管后 healthz 版本为 {EXPECTED_VERSION}", info.get("version") == EXPECTED_VERSION, str(info))
         check("接管后缓存目录正确", Path(info.get("cache_dir", "")).resolve() == cache_v1,
@@ -990,11 +1131,14 @@ def main() -> int:
         )
         author_handle = "kyrie" + "21z"
 
+        store_text = STORE.read_text(encoding="utf-8")
         scanned = [skill_text, readme, readme_cn, publish_text,
                    SERVER.read_text(encoding="utf-8"),
+                   store_text,
                    Path(__file__).read_text(encoding="utf-8")]
         names = ["SKILL.md", "README.md", "README_CN.md", "scripts/publish.py",
-                 "scripts/server.py", "scripts/test_visual_reply.py"]
+                 "scripts/server.py", "scripts/vr_store.py",
+                 "scripts/test_visual_reply.py"]
 
         home_hits = [f"{n}: {p}" for n, t in zip(names, scanned) for p in home_patterns if p in t]
         secret_hits = [f"{n}: {m}" for n, t in zip(names, scanned)
@@ -1067,20 +1211,500 @@ def main() -> int:
                   for c in candidates),
               str(candidates))
 
+        # ---------- 12. 多会话隔离与深链回执 ----------
+        print("\n[12] 多会话隔离与深链回执")
+        base = f"http://127.0.0.1:{port}"
+
+        code, first = publish(port, cache, MD, "会话 A 第一条",
+                              env=clean_env(ANTIGRAVITY_CONVERSATION_ID="conv-alpha"))
+        check("Antigravity 会话发布成功", code == 0 and first.get("ok") is True, str(first))
+        check("会话 ID 取自 ANTIGRAVITY_CONVERSATION_ID",
+              first.get("session_id") == "conv-alpha", str(first.get("session_id")))
+
+        receipt_url = urllib.parse.urlparse(first.get("url", ""))
+        receipt_qs = urllib.parse.parse_qs(receipt_url.query)
+        check("回执 url 为 ?session=&reply= 深链",
+              receipt_qs.get("session") == ["conv-alpha"]
+              and receipt_qs.get("reply") == [first.get("reply_id")],
+              str(first.get("url")))
+        check("回执包含 session_url 与 base_url",
+              first.get("session_url", "").endswith("?session=conv-alpha")
+              and first.get("base_url", "").startswith("http://127.0.0.1:"),
+              f'{first.get("session_url")} / {first.get("base_url")}')
+        check("回执包含 seq / reply_id / session_name",
+              isinstance(first.get("seq"), int) and bool(first.get("reply_id"))
+              and bool(first.get("session_name")), str(first))
+        check("回执报告 notified", first.get("notified") is True, str(first.get("notified")))
+
+        session_file = cache / "sessions" / "conv-alpha" / "session.json"
+        session_rec = json.loads(session_file.read_text("utf-8"))
+        check("会话 client 标记为 antigravity", session_rec.get("client") == "antigravity",
+              str(session_rec.get("client")))
+        check("会话 source 记录环境变量来源",
+              session_rec.get("source") == "env:ANTIGRAVITY_CONVERSATION_ID",
+              str(session_rec.get("source")))
+        check("会话 color 为固定色板值", str(session_rec.get("color", "")).startswith("#"),
+              str(session_rec.get("color")))
+
+        code, second = publish(port, cache, MD, "会话 A 第二条",
+                               env=clean_env(ANTIGRAVITY_CONVERSATION_ID="conv-alpha"))
+        check("同一会话第二条复用 session_id", second.get("session_id") == "conv-alpha",
+              str(second.get("session_id")))
+        check("会话内 seq 递增", second.get("seq") == first.get("seq") + 1,
+              f'{second.get("seq")} != {first.get("seq")} + 1')
+
+        status, replies_a = get_json(f"{base}/api/sessions/conv-alpha/replies")
+        check("GET /api/sessions/<sid>/replies 返回 200", status == 200, str(status))
+        rows_a = replies_a.get("replies", [])
+        check("会话回复条数为 2", len(rows_a) == 2, str(len(rows_a)))
+        check("会话回复最新在前", rows_a and rows_a[0].get("reply_id") == second.get("reply_id"),
+              str([r.get("reply_id") for r in rows_a]))
+
+        _, codex = publish(port, cache, MD, "Codex 线程", env=clean_env(CODEX_THREAD_ID="thread-9"))
+        check("CODEX_THREAD_ID 映射到独立会话", codex.get("session_id") == "thread-9",
+              str(codex.get("session_id")))
+        _, opencode = publish(port, cache, MD, "OpenCode 会话",
+                              env=clean_env(OPENCODE_SESSION_ID="ses_open_1"))
+        check("OPENCODE_SESSION_ID 映射到独立会话",
+              opencode.get("session_id") == "ses_open_1", str(opencode.get("session_id")))
+        _, gemini = publish(port, cache, MD, "Gemini 会话", env=clean_env(GEMINI_SESSION_ID="gem-1"))
+        check("GEMINI_SESSION_ID 映射到独立会话", gemini.get("session_id") == "gem-1",
+              str(gemini.get("session_id")))
+        _, claude = publish(port, cache, MD, "Claude 会话",
+                            env=clean_env(CLAUDE_CODE_REPL_ID="repl-7"))
+        check("CLAUDE_CODE_REPL_ID 映射到独立会话", claude.get("session_id") == "repl-7",
+              str(claude.get("session_id")))
+
+        _, wt_one = publish(port, cache, MD, "终端会话一", env=clean_env(WT_SESSION="wt-abc"))
+        _, wt_two = publish(port, cache, MD, "终端会话二", env=clean_env(WT_SESSION="wt-abc"))
+        _, wt_other = publish(port, cache, MD, "终端会话三", env=clean_env(WT_SESSION="wt-xyz"))
+        check("WT_SESSION 生成终端会话 ID",
+              str(wt_one.get("session_id", "")).startswith("t-"), str(wt_one.get("session_id")))
+        check("同一终端窗口保持同一会话",
+              wt_one.get("session_id") == wt_two.get("session_id"),
+              f'{wt_one.get("session_id")} != {wt_two.get("session_id")}')
+        check("不同终端窗口拆成不同会话",
+              wt_one.get("session_id") != wt_other.get("session_id"),
+              f'{wt_one.get("session_id")} / {wt_other.get("session_id")}')
+
+        code, explicit = publish(port, cache, MD, "显式会话",
+                                 env=clean_env(ANTIGRAVITY_CONVERSATION_ID="conv-alpha"),
+                                 extra=["--session", "team-x", "--session-name", "发布线程"])
+        check("--session 优先级高于环境变量", explicit.get("session_id") == "team-x",
+              str(explicit.get("session_id")))
+        check("--session-name 写入显示名", explicit.get("session_name") == "发布线程",
+              str(explicit.get("session_name")))
+        explicit_rec = json.loads(
+            (cache / "sessions" / "team-x" / "session.json").read_text("utf-8"))
+        check("--session-name 标记 custom_label", explicit_rec.get("custom_label") is True,
+              str(explicit_rec.get("custom_label")))
+        check("--session-name 持久化到 session.json", explicit_rec.get("label") == "发布线程",
+              str(explicit_rec.get("label")))
+
+        code, rejected = publish(port, cache, MD, "非法会话", extra=["--session", "../evil"])
+        check("非法 --session 被拒绝", code == 1 and rejected.get("ok") is False,
+              f"{code} {rejected}")
+        check("非法 --session 报错点名会话 ID", "会话 ID" in str(rejected.get("error", "")),
+              str(rejected.get("error")))
+
+        _, fallback = publish(port, cache, MD, "兜底会话")
+        project_root = detect_project_root(Path.cwd())
+        expected_id = hashlib.sha256(
+            f"{os.getpid()}|{project_root}".encode("utf-8")).hexdigest()[:12]
+        check("无环境变量时按 sha256(ppid|项目根) 兜底",
+              fallback.get("session_id") == expected_id,
+              f'{fallback.get("session_id")} != {expected_id}')
+        fallback_rec = json.loads(
+            (cache / "sessions" / expected_id / "session.json").read_text("utf-8"))
+        check("兜底会话 source 为 fallback:ppid",
+              fallback_rec.get("source") == "fallback:ppid", str(fallback_rec.get("source")))
+
+        status, sessions_payload = get_json(f"{base}/api/sessions")
+        check("GET /api/sessions 返回 200", status == 200, str(status))
+        check("sessions 版本为 4", sessions_payload.get("version") == EXPECTED_VERSION,
+              str(sessions_payload.get("version")))
+        listed = {s.get("id"): s for s in sessions_payload.get("sessions", [])}
+        check("会话列表包含全部新建会话",
+              {"conv-alpha", "thread-9", "ses_open_1", "gem-1", "repl-7", "team-x"} <= set(listed),
+              str(sorted(listed)))
+        check("会话列表按 seq 倒序",
+              all(int(sessions_payload["sessions"][i]["seq"])
+                  >= int(sessions_payload["sessions"][i + 1]["seq"])
+                  for i in range(len(sessions_payload["sessions"]) - 1)),
+              str([s.get("seq") for s in sessions_payload.get("sessions", [])]))
+        check("会话列表含 legacy_count 汇总", "legacy_count" in sessions_payload,
+              str(sessions_payload.get("legacy_count")))
+
+        spec = importlib.util.spec_from_file_location("vr_publish_flags", PUBLISH)
+        flags_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(flags_module)
+        parsed_flags = flags_module.parse_args(
+            ["--session", "s1", "--session-name", "名字", "--agent", "codex"])
+        check("publish 支持 --session / --session-name / --agent",
+              parsed_flags.session == "s1" and parsed_flags.session_name == "名字"
+              and parsed_flags.agent == "codex", str(vars(parsed_flags)))
+
+        # ---------- 13. 多进程并发写入 ----------
+        print("\n[13] 多进程并发写入（8 并发 × 3 会话）")
+        stress_base = f"http://127.0.0.1:{stress_port}"
+        stress_proc = subprocess.Popen(
+            [sys.executable, str(SERVER), "--port", str(stress_port),
+             "--cache-dir", str(stress_cache)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        )
+
+        def stress_up() -> bool:
+            try:
+                _, info = get_json(f"{stress_base}/healthz")
+                return (info.get("version") == EXPECTED_VERSION
+                        and Path(info.get("cache_dir", "")).resolve() == stress_cache)
+            except Exception:
+                return False
+
+        check("并发测试服务已就绪", wait_for(stress_up, 12), "无法连接并发测试服务")
+
+        def run_job(item):
+            index, session_id = item
+            return publish(
+                stress_port, stress_cache,
+                f"# 并发 {index}\n\n第 {index} 条并发内容。\n",
+                f"并发 {index}",
+                fmt="md",
+                extra=["--session", session_id],
+            )
+
+        plan = [(i, ["stress-a", "stress-b", "stress-c"][i % 3]) for i in range(8)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(run_job, plan))
+
+        checks_codes = [code for code, _ in results]
+        receipts = [data for _, data in results]
+        check("8 个并发 publish 退出码全为 0", checks_codes == [0] * 8, str(checks_codes))
+        check("8 个并发 publish 全部 ok", all(r.get("ok") is True for r in receipts),
+              str([r.get("ok") for r in receipts]))
+        reply_ids = [r.get("reply_id") for r in receipts]
+        check("并发回复 ID 无重复", len(set(reply_ids)) == 8, str(reply_ids))
+        seqs = sorted(int(r.get("seq") or 0) for r in receipts)
+        check("并发后 seq 严格单调 1..8", seqs == list(range(1, 9)), str(seqs))
+
+        status, stress_sessions = get_json(f"{stress_base}/api/sessions")
+        by_id = {s.get("id"): s for s in stress_sessions.get("sessions", [])}
+        check("并发建立 3 个会话",
+              {"stress-a", "stress-b", "stress-c"} <= set(by_id), str(sorted(by_id)))
+        check("并发会话回复计数正确",
+              by_id["stress-a"].get("reply_count") == 3
+              and by_id["stress-b"].get("reply_count") == 3
+              and by_id["stress-c"].get("reply_count") == 2,
+              str({k: v.get("reply_count") for k, v in by_id.items()}))
+
+        for session_id, expected in (("stress-a", 3), ("stress-b", 3), ("stress-c", 2)):
+            status, reply_payload = get_json(
+                f"{stress_base}/api/sessions/{session_id}/replies")
+            rows = reply_payload.get("replies", [])
+            check(f"{session_id} 回复条数为 {expected}", len(rows) == expected, str(len(rows)))
+            check(f"{session_id} 回复按 seq 倒序",
+                  all(int(rows[i]["seq"]) >= int(rows[i + 1]["seq"])
+                      for i in range(len(rows) - 1)),
+                  str([r.get("seq") for r in rows]))
+
+        stress_meta = json.loads((stress_cache / "meta.json").read_text("utf-8"))
+        check("并发后 meta.json 仍可解析", isinstance(stress_meta, dict)
+              and stress_meta.get("seq") == 8, str(stress_meta.get("seq")))
+        latest_path = stress_cache / "latest.md"
+        check("并发后 latest.md 仍可读", latest_path.is_file()
+              and bool(latest_path.read_text("utf-8").strip()))
+
+        sidecars = list((stress_cache / "sessions").glob("*/replies/*.meta.json"))
+        check("并发后回复 sidecar 共 8 份", len(sidecars) == 8, str(len(sidecars)))
+        parse_errors = []
+        for sidecar in sidecars:
+            try:
+                json.loads(sidecar.read_text("utf-8"))
+            except ValueError:
+                parse_errors.append(sidecar.name)
+        check("并发后所有 sidecar 均为合法 JSON", not parse_errors, str(parse_errors[:3]))
+
+        feed_path = stress_cache / "global" / "feed.jsonl"
+        feed_lines = [line for line in feed_path.read_text("utf-8").splitlines() if line.strip()]
+        feed_seqs = []
+        for line in feed_lines:
+            try:
+                feed_seqs.append(int(json.loads(line).get("seq") or 0))
+            except ValueError:
+                feed_seqs.append(-1)
+        check("feed.jsonl 记录 8 条且 seq 连续", feed_seqs == list(range(1, 9)), str(feed_seqs))
+
+        status, stress_state = get_json(f"{stress_base}/api/state?since=0")
+        check("并发后 /api/state 补播 8 条事件",
+              len(stress_state.get("events", [])) == 8, str(len(stress_state.get("events", []))))
+
+        # ---------- 13b. 冷启动并发（无预启动服务） ----------
+        print("\n[13b] 冷启动并发（4 进程同时拉起服务）")
+        cold_base = f"http://127.0.0.1:{cold_port}"
+
+        def cold_job(item):
+            index, session_id = item
+            return publish(
+                cold_port, cold_cache,
+                f"# 冷启动 {index}\n\n第 {index} 条并发内容。\n",
+                f"冷启动 {index}",
+                fmt="md",
+                extra=["--session", session_id],
+            )
+
+        cold_plan = [(i, "cold-" + chr(ord("a") + i)) for i in range(4)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            cold_results = list(pool.map(cold_job, cold_plan))
+
+        cold_codes = [code for code, _ in cold_results]
+        cold_receipts = [data for _, data in cold_results]
+        check("冷启动 4 个并发 publish 全部退出 0", cold_codes == [0] * 4, str(cold_codes))
+        check("冷启动 4 个并发 publish 全部 ok",
+              all(r.get("ok") is True for r in cold_receipts),
+              str([r.get("ok") for r in cold_receipts]))
+        cold_servers = [r.get("server") for r in cold_receipts]
+        check("冷启动只有 1 个进程真正 start",
+              cold_servers.count("started") == 1 and cold_servers.count("reused") == 3,
+              str(cold_servers))
+        cold_seqs = sorted(int(r.get("seq") or 0) for r in cold_receipts)
+        check("冷启动回复 seq 为 1..4", cold_seqs == [1, 2, 3, 4], str(cold_seqs))
+
+        status, cold_health = get_json(f"{cold_base}/healthz")
+        pid_file_cold = cold_cache / f".server-{cold_port}.json"
+        cold_pid = None
+        if pid_file_cold.exists():
+            cold_pid = json.loads(pid_file_cold.read_text("utf-8")).get("pid")
+        check("冷启动只留下一个服务 PID",
+              status == 200 and bool(cold_pid) and cold_health.get("pid") == cold_pid,
+              f'{cold_health.get("pid")} vs {cold_pid}')
+        check("冷启动服务版本正确", cold_health.get("version") == EXPECTED_VERSION,
+              str(cold_health.get("version")))
+
+        status, cold_sessions = get_json(f"{cold_base}/api/sessions")
+        cold_ids = {s.get("id") for s in cold_sessions.get("sessions", [])}
+        check("冷启动 4 个会话各自归档",
+              cold_ids == {session_id for _, session_id in cold_plan}, str(sorted(cold_ids)))
+        check("冷启动每个会话各 1 条回复",
+              all(s.get("reply_count") == 1 for s in cold_sessions.get("sessions", [])),
+              str([s.get("reply_count") for s in cold_sessions.get("sessions", [])]))
+        status, cold_state = get_json(f"{cold_base}/api/state?since=0")
+        check("冷启动事件恰好 4 条", len(cold_state.get("events", [])) == 4,
+              str(len(cold_state.get("events", []))))
+
+        # ---------- 14. SSE 实时推送与快速退出 ----------
+        print("\n[14] SSE 实时推送 / 增量补播 / SIGTERM 快速退出")
+        sse = sse_connect(port)
+        banner = read_until(sse, b"retry: 1500", time.time() + 6)
+        check("SSE 返回 200", banner.startswith(b"HTTP/1.") and b" 200 " in banner.split(b"\r\n")[0],
+              banner[:80])
+        check("SSE Content-Type 为 text/event-stream",
+              b"text/event-stream" in banner.lower(), banner[:200])
+        check("SSE 首帧为 : connected 注释", b": connected" in banner, banner[:120])
+        check("SSE 下发 retry: 1500", b"retry: 1500" in banner)
+
+        started_at = time.time()
+        code, live = publish(port, cache, MD, "SSE 实时推送",
+                             env=clean_env(CODEX_THREAD_ID="sse-thread"))
+        frame = read_until(sse, b"event: reply", started_at + 4)
+        elapsed = time.time() - started_at
+        check("发布后 SSE 在 2 秒内推送", b"event: reply" in frame and elapsed < 2.0,
+              f"{elapsed:.2f}s")
+
+        live_events = []
+        for match in re.finditer(rb"data: (.+?)\r?\n", frame):
+            try:
+                live_events.append(json.loads(match.group(1).decode("utf-8")))
+            except ValueError:
+                continue
+        live_event = next((e for e in live_events if e.get("reply_id") == live.get("reply_id")), None)
+        check("SSE 事件与发布回执一致", live_event is not None, str(live_events[:2]))
+        if live_event:
+            check("SSE 事件带 session_id / seq",
+                  live_event.get("session_id") == "sse-thread"
+                  and live_event.get("seq") == live.get("seq"), str(live_event))
+            check("SSE 事件带标题与格式",
+                  live_event.get("title") == "SSE 实时推送"
+                  and live_event.get("format") == "md", str(live_event))
+            check("SSE 事件是 bytes 单帧（含 id/event/data）",
+                  b"id: " + str(live.get("seq")).encode() in frame
+                  and b"event: reply" in frame, frame[-300:])
+
+        status, since_payload = get_json(
+            f"{base}/api/state?since={int(live.get('seq') or 0) - 1}")
+        check("GET /api/state?since= 可补播该事件",
+              any(e.get("reply_id") == live.get("reply_id")
+                  for e in since_payload.get("events", [])),
+              str(since_payload.get("events"))[:300])
+        check("/api/state 返回最新会话指针",
+              since_payload.get("latest_session_id") == "sse-thread",
+              str(since_payload.get("latest_session_id")))
+        try:
+            sse.close()
+        except OSError:
+            pass
+
+        # SIGTERM：挂着 SSE 连接也必须毫秒级退出
+        sse2 = sse_connect(stress_port)
+        banner2 = read_until(sse2, b": connected", time.time() + 6)
+        check("并发测试服务 SSE 已连接", b": connected" in banner2, banner2[:120])
+        stress_pid = None
+        pid_file_stress = stress_cache / f".server-{stress_port}.json"
+        if pid_file_stress.exists():
+            stress_pid = json.loads(pid_file_stress.read_text("utf-8")).get("pid")
+        term_start = time.time()
+        if stress_pid:
+            os.kill(int(stress_pid), signal.SIGTERM)
+        stress_closed = wait_port_closed(stress_port, timeout=6)
+        term_elapsed = time.time() - term_start
+        check("SIGTERM 在 1.5s 内退出（SSE 连接仍开着）",
+              bool(stress_pid) and stress_closed and term_elapsed < 1.5,
+              f"{term_elapsed:.3f}s closed={stress_closed}")
+        try:
+            sse2.close()
+        except OSError:
+            pass
+        if stress_proc is not None:
+            try:
+                stress_proc.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                stress_proc.kill()
+            check("并发测试服务进程已回收", stress_proc.poll() is not None)
+
+        # ---------- 15. 会话元数据 / 路径穿越 / 会话 Artifact ----------
+        print("\n[15] 会话置顶重命名、路径穿越防护、会话 Artifact")
+        status, body, _ = raw_request(
+            port, "POST", "/api/sessions/conv-alpha",
+            body=json.dumps({"label": "重命名后的会话", "pinned": True}, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+        )
+        check("POST /api/sessions/<sid> 返回 200", status == 200, f"{status} {body[:120]}")
+        updated = json.loads(body.decode("utf-8"))
+        check("重命名写入 label", updated.get("session", {}).get("label") == "重命名后的会话",
+              str(updated.get("session", {}).get("label")))
+        check("置顶写入 pinned", updated.get("session", {}).get("pinned") is True,
+              str(updated.get("session", {}).get("pinned")))
+
+        status, pinned_payload = get_json(f"{base}/api/sessions")
+        check("置顶会话排在列表首位",
+              pinned_payload.get("sessions") and pinned_payload["sessions"][0].get("id") == "conv-alpha",
+              str([s.get("id") for s in pinned_payload.get("sessions", [])][:3]))
+
+        status, body, _ = raw_request(
+            port, "POST", "/api/sessions/conv-alpha", body="{not-json",
+            headers={"Content-Type": "application/json"})
+        check("POST 非法 JSON 返回 400", status == 400, str(status))
+
+        status, body, _ = raw_request(
+            port, "POST", "/api/sessions/does-not-exist", body='{"label":"x"}',
+            headers={"Content-Type": "application/json"})
+        check("POST 未知会话返回 404", status == 404, str(status))
+
+        for label, path in [
+            ("/api/sessions/../replies", "/api/sessions/../replies"),
+            ("/api/sessions/%2e%2e/replies", "/api/sessions/%2e%2e/replies"),
+            ("/api/sessions/../../etc", "/api/sessions/../../etc"),
+            ("/artifact/session/../x", "/artifact/session/../x"),
+            ("/artifact/session/..%2Fmeta.json", "/artifact/session/..%2Fmeta.json"),
+            ("/artifact/session/%2e%2e/%2e%2e", "/artifact/session/%2e%2e/%2e%2e"),
+        ]:
+            status, _, _ = raw_request(port, "GET", path)
+            check(f"会话路径穿越被拒绝 {label}", status in (400, 404), str(status))
+
+        status, _, _ = raw_request(
+            port, "POST", "/api/sessions/..", body='{"pinned":true}',
+            headers={"Content-Type": "application/json"})
+        check("POST 路径穿越返回 400", status == 400, str(status))
+
+        code, artifact_receipt = publish(
+            port, cache, HTML_DOC, "会话 Artifact", env=clean_env(),
+            extra=["--session", "art-1"])
+        check("会话 Artifact 发布成功", code == 0 and artifact_receipt.get("ok") is True,
+              str(artifact_receipt))
+        artifact_rid = urllib.parse.quote(artifact_receipt.get("reply_id", ""), safe="")
+        status, body, headers = raw_request(
+            port, "GET", f"/artifact/session/art-1/{artifact_rid}")
+        check("GET /artifact/session/<sid>/<rid> 返回 200", status == 200, str(status))
+        check("会话 Artifact 为 text/html",
+              "text/html" in headers.get("Content-Type", ""), headers.get("Content-Type", ""))
+        check("会话 Artifact 原文一致", body.decode("utf-8") == HTML_DOC)
+
+        code, markdown_receipt = publish(
+            port, cache, MD, "会话里的 Markdown", env=clean_env(),
+            extra=["--session", "art-1"])
+        md_rid = urllib.parse.quote(markdown_receipt.get("reply_id", ""), safe="")
+        status, _, _ = raw_request(port, "GET", f"/artifact/session/art-1/{md_rid}")
+        check("非 html 回复的 artifact 返回 404", status == 404, str(status))
+
+        status, _, _ = raw_request(port, "GET", "/artifact/session/art-1/..%2F..%2Fmeta.json")
+        check("artifact rid 穿越被拒绝", status in (400, 404), str(status))
+
+        # ---------- 16. 工作台前端标记 ----------
+        print("\n[16] 多会话工作台前端标记")
+        status, body, _ = http(f"{base}/")
+        page = body.decode("utf-8", errors="replace")
+
+        for token in ('id="session-rail"', 'id="pane-primary"', 'id="pane-secondary"',
+                      'id="new-reply-banner"', 'id="mode-btn"', 'id="rail-toggle"',
+                      'id="feed-btn"', 'id="reading-pane"', 'id="content"',
+                      'id="canvas-root"', 'id="artifact-frame"', 'id="artifact-source"',
+                      'id="mindmap-pane"', 'id="history-select"', 'id="drawer"'):
+            check(f"页面保留/新增 {token}", token in page)
+
+        for fn in ("renderIntoPane", "openSplit", "closeSplit", "handleEvent",
+                   "focusSession", "renderRail", "renderFeed", "connectEvents",
+                   "switchToLatestReply", "unreadCount", "togglePin", "renameSession",
+                   "poll", "refreshLatestNow", "applyUrl", "writeUrl", "readUrl",
+                   "totalUnread", "updateDocumentTitle", "refitPanes"):
+            check(f"前端实现 {fn}", f"function {fn}" in page)
+
+        for token in ("new EventSource('/api/events')", "URLSearchParams",
+                      "history.replaceState", "popstate", "vr.lastSeen",
+                      "锁定会话", "跟随全局", "本会话有新回复", "切到最新",
+                      "全局时间线", "未读", "置顶", "分屏", "data-filter=",
+                      "/api/sessions/", "/api/state?since=", "/api/feed",
+                      'data-pane-role="reading"', 'pane-canvas-root', 'pane-artifact-frame',
+                      "app.lastHandledSeq", "seq <= app.lastHandledSeq",
+                      ".pane-set.view-split .pane-frame { flex-direction: column; }",
+                      "pane.name === 'primary') closeDrawer();",
+                      "'(' + unread + ') '", "setTimeout(function () {"):
+            check(f"页面包含 {token}", token in page)
+
+        check("Markdown 渲染逻辑只有一份",
+              page.count("function renderReading(") == 1, str(page.count("function renderReading(")))
+        check("画布渲染逻辑只有一份",
+              page.count("function renderCanvas(") == 1, str(page.count("function renderCanvas(")))
+        check("Artifact 渲染逻辑只有一份",
+              page.count("function syncArtifact(") == 1, str(page.count("function syncArtifact(")))
+        check("两窗格共用 renderIntoPane",
+              page.count("renderIntoPane(") >= 4, str(page.count("renderIntoPane(")))
+        check("主窗格保留 legacy DOM id",
+              all(f'id="{x}"' in page for x in
+                  ("reading-pane", "content", "canvas-root", "artifact-frame", "empty")))
+        check("焦点锁提示文案存在",
+              "其它会话只提示，不跳转" in page or "不劫持" in page
+              or "锁定当前会话" in page)
+
     finally:
-        print("\n[12] 清理")
+        print("\n[17] 清理")
         if fake_proc is not None and fake_proc.poll() is None:
             fake_proc.kill()
             fake_proc.wait(timeout=5)
+        if stress_proc is not None and stress_proc.poll() is None:
+            stress_proc.kill()
+            stress_proc.wait(timeout=5)
         stop_server(cache, port)
         stop_server(cache_v1, port_v1)
-        closed = wait_port_closed(port) and wait_port_closed(port_v1)
-        check("测试服务已关闭", closed, f"端口 {port} / {port_v1} 仍可连接")
-        shutil.rmtree(cache, ignore_errors=True)
-        shutil.rmtree(cache_v1, ignore_errors=True)
-        shutil.rmtree(geo_dir, ignore_errors=True)
-        check("临时目录已清理", not cache.exists() and not cache_v1.exists() and not geo_dir.exists(),
-              f"{cache} / {cache_v1} / {geo_dir}")
+        stop_server(stress_cache, stress_port)
+        stop_server(cold_cache, cold_port)
+        closed = (wait_port_closed(port) and wait_port_closed(port_v1)
+                  and wait_port_closed(stress_port) and wait_port_closed(cold_port))
+        check("测试服务已关闭", closed,
+              f"端口 {port} / {port_v1} / {stress_port} / {cold_port} 仍可连接")
+        for path in (cache, cache_v1, geo_dir, stress_cache, cold_cache):
+            shutil.rmtree(path, ignore_errors=True)
+        check("临时目录已清理",
+              not any(p.exists() for p in (cache, cache_v1, geo_dir, stress_cache, cold_cache)),
+              f"{cache} / {cache_v1} / {geo_dir} / {stress_cache} / {cold_cache}")
 
     total = PASSED + len(FAILED)
     print(f"\n结果: {PASSED}/{total} 通过")

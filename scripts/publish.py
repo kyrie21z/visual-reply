@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把结构化内容发布到 visual-reply 本地预览服务（v2）。
+"""把结构化内容发布到 visual-reply 本地预览服务（v4，多会话）。
 
 支持三种载荷格式：
     json  Visual Canvas 交互画布（sections: kpis / graph / comparison / bento / steps）
@@ -11,13 +11,17 @@
     python3 publish.py --title "交互原型" --format html --file demo.html
     python3 publish.py --title "说明" --stdin
     python3 publish.py --title "方案" --stdin --port 18800 --cache-dir /tmp/vr
+    python3 publish.py --title "子任务" --stdin --session build-42 --session-name "构建线程"
 
 行为：
-    1. 检测 / 校验载荷格式，写入 <cache>/latest.<ext> 与 meta.json（version=2）；
-    2. 在 <cache>/history/ 归档载荷与独立 sidecar（.<ext>.meta.json）；
-    3. 端口未监听时后台启动 server.py；若发现旧版 v1 服务则接管重启；
-    4. 仅在本次新拉起服务且未指定 --no-browser 时打开浏览器；
-    5. 输出 JSON 状态。
+    1. 解析会话（--session / 环境变量 / 终端复用器 / 父进程兜底）；
+    2. 在 <cache>/.publish.lock 内提交回复：
+       sessions/<sid>/replies/<reply_id>.<ext> + sidecar、state.json、global/feed.jsonl，
+       并同步写 v3 兼容投影 latest.<ext> / meta.json / history/；
+    3. 端口未监听时后台启动 server.py；若发现旧版服务则接管重启；
+    4. 尽力 POST /api/notify 唤醒 SSE，让已打开页面立即刷新；
+    5. 仅在本次新拉起服务且未指定 --no-browser 时打开浏览器；
+    6. 输出 JSON 状态（含 ?session=&reply= 深链）。
 """
 
 from __future__ import annotations
@@ -33,33 +37,26 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import vr_store  # noqa: E402  - 同上：保证按路径加载时也能 import
 
 DEFAULT_PORT = 18765
 DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
 SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
-VERSION = 3
+VERSION = 4
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 
 # 长度提醒阈值：只警告，不阻塞发布
 HEADLINE_MAX_CHARS = 40
 EDGE_LABEL_MAX_CHARS = 14
-
-
-def iso_time(ts: float) -> str:
-    return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
-
-
-def slugify(title: str, limit: int = 40) -> str:
-    text = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "-", title).strip(" .-")
-    text = re.sub(r"\s+", "-", text)
-    text = re.sub(r"-{2,}", "-", text)
-    return (text[:limit].strip("-") or "reply")
 
 
 def first_heading(text: str) -> str:
@@ -156,12 +153,6 @@ def length_warnings(data: dict) -> list:
     return warnings
 
 
-def atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def read_content(args: argparse.Namespace) -> str:
     if args.file:
         path = Path(args.file).expanduser()
@@ -189,6 +180,20 @@ def health(port: int, timeout: float = 1.0):
         return http_json(f"http://127.0.0.1:{port}/healthz", timeout=timeout)
     except (urllib.error.URLError, socket.timeout, ValueError, OSError):
         return None
+
+
+def post_json(url: str, payload: dict, timeout: float = 0.6) -> bool:
+    """尽力通知；服务正在启动或繁忙时静默失败，不阻塞发布。"""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, socket.timeout, ValueError, OSError):
+        return False
 
 
 def port_open(port: int) -> bool:
@@ -280,13 +285,24 @@ def start_server(port: int, cache_dir: Path) -> subprocess.Popen:
 
 def wait_ready(port: int, proc: subprocess.Popen | None, cache_dir: Path,
                timeout: float = 12.0, expect_version: int | None = None) -> dict:
+    def acceptable(candidate) -> bool:
+        if not candidate or candidate.get("service") != SERVICE_NAME:
+            return False
+        if expect_version is None:
+            return True
+        return int(candidate.get("version", 1) or 1) >= expect_version
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         info = health(port)
-        if info and info.get("service") == SERVICE_NAME:
-            if expect_version is None or int(info.get("version", 1) or 1) >= expect_version:
-                return info
+        if acceptable(info):
+            return info
         if proc is not None and proc.poll() is not None:
+            # 子进程已退出（例如端口被别的实例抢先绑定）：最后确认一次再报错
+            time.sleep(0.05)
+            info = health(port)
+            if acceptable(info):
+                return info
             break
         time.sleep(0.1)
     tail = ""
@@ -300,44 +316,8 @@ def wait_ready(port: int, proc: subprocess.Popen | None, cache_dir: Path,
     raise RuntimeError("服务启动失败或健康检查超时" + (f"\n--- server.log ---\n{tail}" if tail else ""))
 
 
-def archive(cache_dir: Path, title: str, content: str, fmt: str) -> tuple[Path, Path]:
-    """归档载荷到 history/，并写入独立的 .meta.json sidecar。"""
-    history = cache_dir / "history"
-    history.mkdir(parents=True, exist_ok=True)
-    ext = FORMAT_EXT[fmt]
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    base = f"{stamp}-{slugify(title)}"
-
-    # 同一时间戳下按“词干”去重，避免 json 载荷与 md 归档同名而互相遮挡
-    used = set()
-    for item in history.iterdir():
-        if not item.is_file() or item.name.endswith(".meta.json"):
-            continue
-        if item.suffix in (".md", ".json", ".html"):
-            used.add(item.stem)
-
-    stem = base
-    index = 2
-    while stem in used:
-        stem = f"{base}-{index}"
-        index += 1
-    target = history / f"{stem}{ext}"
-
-    target.write_text(content, encoding="utf-8")
-    sidecar = target.with_name(target.name + ".meta.json")
-    sidecar.write_text(json.dumps({
-        "version": VERSION,
-        "format": fmt,
-        "title": title,
-        "created_at": iso_time(time.time()),
-        "updated_at": iso_time(target.stat().st_mtime),
-        "chars": len(content),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-    return target, sidecar
-
-
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="发布可视化内容到 visual-reply 预览服务")
+    parser = argparse.ArgumentParser(description="发布可视化内容到 visual-reply 预览服务（多会话）")
     parser.add_argument("--title", default="", help="标题")
     parser.add_argument("--file", help="从文件读取内容")
     parser.add_argument("--stdin", action="store_true", help="从标准输入读取内容")
@@ -348,7 +328,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help=f"服务端口（默认 {DEFAULT_PORT}）")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR),
                         help=f"缓存目录（默认 {DEFAULT_CACHE_DIR}）")
+    parser.add_argument("--session", default="",
+                        help="会话 ID（默认自动检测：环境变量 / 终端复用器 / 父进程）")
+    parser.add_argument("--session-name", default="", help="会话显示名（会持久化到 session.json）")
+    parser.add_argument("--agent", default="", help="客户端标识，如 codex / claude / antigravity")
     return parser.parse_args(argv)
+
+
+def notify_server(port: int, payload: dict) -> bool:
+    return post_json(f"http://127.0.0.1:{port}/api/notify", payload, timeout=0.6)
 
 
 def main(argv=None) -> int:
@@ -356,6 +344,16 @@ def main(argv=None) -> int:
     cache_dir = Path(args.cache_dir).expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "history").mkdir(parents=True, exist_ok=True)
+
+    try:
+        session = vr_store.resolve_session(
+            explicit_session=args.session or None,
+            session_name=args.session_name or None,
+            agent=args.agent or None,
+        )
+    except ValueError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 1
 
     content = read_content(args)
     if not content or not content.strip():
@@ -383,101 +381,132 @@ def main(argv=None) -> int:
 
     title = (args.title or derive_title(fmt, content) or "未命名回复").strip()
 
-    # 1. 写入最新载荷
-    ext = FORMAT_EXT[fmt]
-    latest = cache_dir / f"latest{ext}"
-    atomic_write(latest, content)
-    mtime = latest.stat().st_mtime
-    atomic_write(cache_dir / "meta.json", json.dumps({
-        "version": VERSION,
-        "format": fmt,
-        "title": title,
-        "mtime": mtime,
-        "updated_at": iso_time(mtime),
-        "chars": len(content),
-        "payload_file": latest.name,
-    }, ensure_ascii=False, indent=2))
+    # 1. 在锁内提交回复（会话归档 + v3 投影）
+    try:
+        with vr_store.cache_lock(cache_dir):
+            receipt = vr_store.commit_reply(cache_dir, session, content, fmt, title)
+    except vr_store.LockTimeout as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "cache_dir": str(cache_dir)},
+                         ensure_ascii=False))
+        return 1
+    except OSError as exc:
+        print(json.dumps({"ok": False, "error": f"写入失败: {exc}"}, ensure_ascii=False))
+        return 1
 
-    # 2. 归档历史
-    history_file, history_meta = archive(cache_dir, title, content, fmt)
+    session_id = session["id"]
+    reply_id = receipt["reply_id"]
+    seq = receipt["seq"]
 
-    # 3. 确保服务在线（必要时接管旧版 v1）
+    # 2. 确保服务在线（必要时接管旧版）
+    #    冷启动时 4 个 Agent 可能同时行动：用 .server.lock 串行化，只有第一个进程
+    #    真正 start_server()，其余等锁后直接复用，避免同时 bind 同一端口。
     started = False
     proc = None
-    info = health(args.port)
-    if info and info.get("service") == SERVICE_NAME:
-        running_cache = Path(info.get("cache_dir", "")).resolve()
-        if running_cache != cache_dir:
-            print(json.dumps({
-                "ok": False,
-                "error": "该端口已被另一个 visual-reply 实例占用（缓存目录不同）",
-                "port": args.port,
-                "running_cache_dir": str(running_cache),
-                "requested_cache_dir": str(cache_dir),
-            }, ensure_ascii=False))
-            return 2
+    info = None
+    server_state = "reused"
+    try:
+        with vr_store.server_lock(cache_dir):
+            info = health(args.port)
+            if info is None and port_open(args.port):
+                # 端口在监听却拿不到健康信息：并发发布时本服务可能正忙，再给一次机会
+                info = health(args.port, timeout=3.0)
 
-        running_version = int(info.get("version", 1) or 1)
-        if running_version < VERSION:
-            pid = info.get("pid")
-            if not isinstance(pid, int) or pid <= 0:
+            if info and info.get("service") == SERVICE_NAME:
+                running_cache = Path(info.get("cache_dir", "")).resolve()
+                if running_cache != cache_dir:
+                    print(json.dumps({
+                        "ok": False,
+                        "error": "该端口已被另一个 visual-reply 实例占用（缓存目录不同）",
+                        "port": args.port,
+                        "running_cache_dir": str(running_cache),
+                        "requested_cache_dir": str(cache_dir),
+                    }, ensure_ascii=False))
+                    return 2
+
+                running_version = int(info.get("version", 1) or 1)
+                if running_version < VERSION:
+                    pid = info.get("pid")
+                    if not isinstance(pid, int) or pid <= 0:
+                        print(json.dumps({
+                            "ok": False,
+                            "error": "检测到旧版服务但缺少 pid，无法自动接管，请手动结束该进程",
+                            "port": args.port,
+                            "running_version": running_version,
+                        }, ensure_ascii=False))
+                        return 2
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError as exc:
+                        print(json.dumps({
+                            "ok": False,
+                            "error": f"无法终止旧版服务 pid={pid}: {exc}",
+                            "port": args.port,
+                        }, ensure_ascii=False))
+                        return 2
+                    if not wait_port_closed(args.port):
+                        print(json.dumps({
+                            "ok": False,
+                            "error": "旧版服务未在超时内释放端口",
+                            "port": args.port,
+                            "pid": pid,
+                        }, ensure_ascii=False))
+                        return 2
+                    try:
+                        proc = start_server(args.port, cache_dir)
+                        info = wait_ready(args.port, proc, cache_dir, expect_version=VERSION)
+                    except RuntimeError as exc:
+                        print(json.dumps({"ok": False, "error": str(exc), "port": args.port},
+                                         ensure_ascii=False))
+                        return 2
+                    started = True
+                    server_state = "upgraded"
+                else:
+                    server_state = "reused"
+            elif port_open(args.port):
                 print(json.dumps({
                     "ok": False,
-                    "error": "检测到旧版服务但缺少 pid，无法自动接管，请手动结束该进程",
-                    "port": args.port,
-                    "running_version": running_version,
-                }, ensure_ascii=False))
-                return 2
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except PermissionError as exc:
-                print(json.dumps({
-                    "ok": False,
-                    "error": f"无法终止旧版服务 pid={pid}: {exc}",
+                    "error": f"端口 {args.port} 已被其他进程占用（健康检查无响应）",
                     "port": args.port,
                 }, ensure_ascii=False))
                 return 2
-            if not wait_port_closed(args.port):
-                print(json.dumps({
-                    "ok": False,
-                    "error": "旧版服务未在超时内释放端口",
-                    "port": args.port,
-                    "pid": pid,
-                }, ensure_ascii=False))
-                return 2
-            try:
+            else:
                 proc = start_server(args.port, cache_dir)
-                info = wait_ready(args.port, proc, cache_dir, expect_version=VERSION)
-            except RuntimeError as exc:
-                print(json.dumps({"ok": False, "error": str(exc), "port": args.port},
-                                 ensure_ascii=False))
-                return 2
-            started = True
-            server_state = "upgraded"
-        else:
-            server_state = "reused"
-    elif port_open(args.port):
+                started = True
+                try:
+                    info = wait_ready(args.port, proc, cache_dir, expect_version=VERSION)
+                except RuntimeError as exc:
+                    print(json.dumps({"ok": False, "error": str(exc), "port": args.port},
+                                     ensure_ascii=False))
+                    return 2
+                server_state = "started"
+    except vr_store.LockTimeout as exc:
         print(json.dumps({
             "ok": False,
-            "error": f"端口 {args.port} 已被其他进程占用",
+            "error": f"等待服务启动锁超时: {exc}",
             "port": args.port,
         }, ensure_ascii=False))
         return 2
-    else:
-        proc = start_server(args.port, cache_dir)
-        started = True
-        try:
-            info = wait_ready(args.port, proc, cache_dir, expect_version=VERSION)
-        except RuntimeError as exc:
-            print(json.dumps({"ok": False, "error": str(exc), "port": args.port},
-                             ensure_ascii=False))
-            return 2
-        server_state = "started"
 
-    # 4. 仅在本次拉起服务时打开浏览器
-    url = f"http://127.0.0.1:{args.port}"
+    # 3. 唤醒 SSE 客户端（失败不影响发布）
+    notified = notify_server(args.port, {
+        "seq": seq,
+        "session_id": session_id,
+        "session_label": receipt["session"]["label"],
+        "reply_id": reply_id,
+        "title": title,
+        "format": fmt,
+        "updated_at": receipt["feed"]["updated_at"],
+    })
+
+    # 4. 深链：首次拉起服务时直接打开对应会话与回复
+    base_url = f"http://127.0.0.1:{args.port}"
+    query = urllib.parse.urlencode({"session": session_id, "reply": reply_id})
+    session_query = urllib.parse.urlencode({"session": session_id})
+    url = f"{base_url}/?{query}"
+    session_url = f"{base_url}/?{session_query}"
+
     browser = None
     if started and not args.no_browser:
         browser = open_browser(url)
@@ -488,14 +517,23 @@ def main(argv=None) -> int:
         "format": fmt,
         "title": title,
         "url": url,
+        "base_url": base_url,
+        "session_url": session_url,
+        "session_id": session_id,
+        "session_name": receipt["session"]["label"],
+        "reply_id": reply_id,
+        "seq": seq,
         "port": args.port,
         "cache_dir": str(cache_dir),
-        "latest": str(latest),
-        "history_file": str(history_file),
-        "history_meta": str(history_meta),
+        "latest": receipt["latest"],
+        "history_file": receipt["history_file"],
+        "history_meta": receipt["history_meta"],
+        "reply_file": receipt["reply_path"],
+        "reply_meta": receipt["reply_meta"],
         "chars": len(content),
         "server": server_state,
         "server_version": info.get("version") if info else None,
+        "notified": notified,
         "browser": browser,
     }
     warnings = length_warnings(parsed) if isinstance(parsed, dict) else []
