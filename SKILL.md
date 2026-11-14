@@ -1,9 +1,9 @@
 ---
 name: visual-reply
-description: Visual-First 交互画布：把结论、架构、方案对比、执行计划发布为本机可视化网页。JSON 画布（拓扑图 / 对比评分 / Bento / 步骤条 / KPI）、HTML Artifact 沙箱、Markdown 兼容三模式，详情折叠进右侧抽屉，终端只回传短结论与 http://127.0.0.1:18765 链接。
+description: Visual-First 交互画布：把结论、架构、方案对比、执行计划发布为本机可视化网页。JSON 画布（拓扑图 / 对比评分 / Bento / 步骤条 / KPI）、HTML Artifact 沙箱、Markdown 兼容三模式，详情折叠进右侧抽屉；多会话工作台自动识别 Agent 线程，左侧会话栏 + 焦点锁 + 分屏，终端只回传短结论与 http://127.0.0.1:18765 链接。
 ---
 
-# Visual Reply v2
+# Visual Reply v4
 
 把结构化结论发布成本机可视化网页，让用户在浏览器里**看**，而不是在终端里滚动长文。
 
@@ -65,6 +65,54 @@ python "${SKILL_DIR}/scripts/publish.py" --help
 4. **一个画布讲一件事**
    - `sections` 控制在 2 到 5 个，按「结论 → 依据 → 落地」排列。
    - 节点 `id` 稳定、`layer` 明确，避免让自动分层猜错。
+
+---
+
+## 多会话工作台（v4）
+
+一个浏览器页面同时托管多个 Agent 会话，默认按「谁发布、谁归属」自动分栏，不需要任何配置。
+
+### 会话是怎么识别的
+
+`publish.py` 按下面的优先级推导会话 ID，命中即停：
+
+| 顺序 | 来源 | 说明 |
+| --- | --- | --- |
+| 1 | `--session <id>` | 显式指定，优先级最高；非法 ID 直接拒绝发布 |
+| 2 | `VISUAL_REPLY_SESSION` | 通用环境变量，适合脚本批量发布 |
+| 3 | Agent 客户端环境变量 | `ANTIGRAVITY_CONVERSATION_ID`、`CODEX_THREAD_ID` / `CODEX_SESSION_ID`、`OPENCODE_SESSION_ID`、`GEMINI_SESSION_ID`、`CLAUDE_SESSION_ID` / `CLAUDE_CODE_REPL_ID` |
+| 4 | 终端复用器 | `WT_SESSION`、`TMUX_PANE`、`WEZTERM_PANE`、`KITTY_WINDOW_ID`、`ITERM_SESSION_ID` |
+| 5 | 父进程兜底 | `sha256(父进程 ID \| 项目根)[:12]`，同一 shell 稳定、不同终端分开 |
+
+会话显示名默认是 `项目 · 客户端 · 短 ID`。想固定成人类可读的名字：
+
+```bash
+python3 ${SKILL_DIR}/scripts/publish.py \
+  --title "构建线程" --stdin --session build-42 --session-name "CI 构建"
+```
+
+`--session-name` 会持久化到该会话的 `session.json`，之后同会话发布不传也不会丢；想覆盖就再传一次。
+`--agent codex` 只是给客户端徽标打标签，不参与 ID 推导。
+
+### 页面里怎么用
+
+- **左侧会话栏**：按「置顶 → 最近发布」排序，卡片上有色条、客户端徽标、最新标题、时间与未读角标；顶部可筛 `全部 / 未读 / 置顶`，底部 `全局时间线` 汇总跨会话历史。
+- **焦点锁（默认）**：点开会话即锁定该会话。其它会话的新回复**不会**劫持主窗格，只在左侧标未读并弹一个带 `[查看]` 的小提示。
+- **阅读守卫**：即使就在当前会话里，只要 Inspector 抽屉开着、或正在回看历史轮次，新回复也只显示顶部横幅「本会话有新回复 [切到最新]」，不关抽屉、不替换正在读的内容。
+- **分屏**：会话卡片上的 `◫` 打开第二窗格，两个窗格各自选会话、各自切换阅读 / 脑图 / 分屏视图，共享同一个 Inspector 抽屉。
+- **顶部按钮**：`锁定会话` / `跟随全局` 可随时切换；`会话` 折叠左栏；`回到最新` 从历史轮次回到最新。
+
+深链参数（可直接贴给用户）：
+
+| 参数 | 含义 |
+| --- | --- |
+| `?session=<sid>` | 聚焦某个会话 |
+| `?reply=<rid>` | 直接打开某条回复（配合 `session`） |
+| `?split=<sid2>` | 右侧分屏显示第二个会话 |
+| `?layout=h\|v` | 分屏方向：左右 / 上下 |
+| `?mode=lock\|global` | 焦点锁 / 跟随全局 |
+
+发布回执里的 `url` 已经是 `?session=<sid>&reply=<rid>` 深链，直接打开即可定位到这次回复。
 
 ---
 
@@ -202,13 +250,15 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 发布成功后，终端**只输出**两样东西：
 
 1. 3 到 6 行核心结论（不是全文复述）
-2. 预览链接 `http://127.0.0.1:18765`
+2. 回执 JSON 里的 `url` **原样**打印 —— 它是带 `?session=<sid>&reply=<rid>` 的深链，点开就能定位到这次回复
 
 ```
 已生成视觉画布：1 个拓扑图、2 个方案对比、3 张 Bento、4 步计划。
 结论：方案 B 胜出，改动集中在中台层，回滚 90s。
-细节已折叠在右侧抽屉：http://127.0.0.1:18765
+细节已折叠在右侧抽屉：http://127.0.0.1:18765/?session=codex-7f3a&reply=20261114-101500-000001-plan-b
 ```
+
+**不要截断或改写查询参数**：`?session=` 决定打开哪个会话、`?reply=` 定位到哪一轮回复，删掉后用户会落到默认页面、看不到刚发布的内容。只有回执无法解析（脚本异常、非 JSON 输出）时才退化为基地址 `http://127.0.0.1:18765`。
 
 不要把发布过的正文再贴一遍，用户已经在浏览器里看到了。JSON 里的路径、字符数等细节无需复述，除非发布失败。
 
@@ -222,7 +272,7 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | B · HTML Artifact | `format = html` | 全屏 `<iframe sandbox="allow-scripts">` 渲染 `/artifact/latest`；顶部 `[全屏]` / `[源码]` 切换；查看历史时加载 `/artifact/history/<filename>` |
 | C · 兼容阅读 | `format = md` | 阅读 / 脑图 / 分屏三视图，Mermaid 图表、标题折叠、表格 |
 
-所有模式共享：浅色/深色主题切换、最近 20 条历史下拉、每 1 秒轮询 `mtime` 的热更新——再次发布会自动刷新当前页面。
+所有模式共享：浅色/深色主题切换、会话内回复轮次下拉（`#n (最新) · 标题`，另附全局 v3 归档）、SSE 实时推送 + 3 秒轮询兜底——再次发布会在 100ms 级自动刷新当前页面。
 
 组件语义速查：
 
@@ -255,19 +305,34 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `--no-browser` | 不自动打开浏览器 |
 | `--port` | 服务端口，默认 `18765` |
 | `--cache-dir` | 缓存目录，默认 `~/.cache/agent-visual-reply` |
+| `--session` | 会话 ID（默认自动检测，优先级最高） |
+| `--session-name` | 会话显示名，持久化到 `session.json` |
+| `--agent` | 客户端徽标，如 `codex` / `claude` / `antigravity` |
 
 缓存结构：
 
 ```
 ~/.cache/agent-visual-reply/
-├── latest.json | latest.html | latest.md   # 当前载荷（按 format 只写其一）
-├── meta.json          # {version: 3, format, title, mtime, updated_at, chars, payload_file}
+├── .publish.lock                     # 写锁：跨平台排他锁（POSIX flock / Windows msvcrt）
+├── .server.lock                      # 启动锁：冷启动时串行化 server.py 拉起
+├── state.json                        # {version: 4, seq, latest_session_id, latest_reply_id}
+├── sessions/
+│   └── <sid>/
+│       ├── session.json              # label / client / project / pinned / seq / reply_count
+│       └── replies/
+│           ├── 20261114-101500-000001-plan-b.md
+│           └── 20261114-101500-000001-plan-b.md.meta.json
+├── global/feed.jsonl                 # 跨会话追加式时间线（seq 单调递增）
+├── latest.json | latest.html | latest.md   # v3 兼容投影：当前载荷（按 format 只写其一）
+├── meta.json                         # v3 兼容投影，额外带 seq / session_id / reply_id
 ├── server.log
-└── history/
+└── history/                          # v3 兼容投影，旧客户端照常读
     ├── 20261114-101500-标题.json
-    ├── 20261114-101500-标题.json.meta.json  # 独立 sidecar，不与 json 载荷冲突
-    └── 20261114-095500-旧内容.md            # v1 归档，继续兼容
+    ├── 20261114-101500-标题.json.meta.json
+    └── 20261114-095500-旧内容.md
 ```
+
+`reply_id` 形如 `20261114-101500-000001-plan-b`：时间戳 + 全局序号 + ASCII 片段，天然可排序、可直接拼 URL。
 
 ## 服务接口
 
@@ -279,7 +344,16 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `GET /api/history/<filename>` | `{format, title, content, updated_at, mtime}` |
 | `GET /artifact/latest` | 当前 HTML Artifact 原文，`text/html; charset=utf-8`；非 html 格式返回 404 |
 | `GET /artifact/history/<filename>` | 历史 HTML Artifact 原文 |
-| `GET /healthz` | `{ok, service, version, pid, port, cache_dir}` |
+| `GET /api/sessions` | `{version, seq, latest_session_id, sessions: [...], legacy_count}`，置顶优先、seq 倒序 |
+| `GET /api/sessions/<sid>/replies?limit=200` | 该会话的回复轮次，最新在前 |
+| `GET /api/sessions/<sid>/replies/<rid>` | `{version, session, reply, content}` |
+| `GET /api/feed?limit=50` | 跨会话全局时间线（含 v3 遗留归档） |
+| `GET /api/state?since=<seq>` | 增量事件，供断线补播 |
+| `GET /api/events` | SSE 实时推送（`text/event-stream`） |
+| `POST /api/notify` | 发布后唤醒 SSE，`{seq, session_id, reply_id, title, format}` |
+| `POST /api/sessions/<sid>` | 更新 `{label, pinned}`，原子写入 |
+| `GET /artifact/session/<sid>/<rid>` | 会话回复的 HTML 原文 |
+| `GET /healthz` | `{ok, service, version, pid, port, cache_dir, seq}` |
 
 服务只监听 `127.0.0.1`。需要单独启动时：
 
@@ -297,6 +371,9 @@ python3 ${SKILL_DIR}/scripts/server.py --port 18765
 - **宽图右侧看不全**：点拓扑图右上角「适应」按容器宽度缩放（最低 0.35）；`100%` 恢复原始尺寸，`−` / `+` 微调。
 - **图表/脑图不显示**：页面通过 jsdelivr CDN 加载 `marked`、`mermaid`、`markmap`，离线时退化为纯文本；JSON 画布不依赖 CDN（Markdown 抽屉除外）。
 - **改了内容但页面没变**：确认发布到同一端口与同一 `--cache-dir`；右上角状态点应显示「已同步」。
+- **新回复没自动出现**：先看右上角状态点；SSE 断线时会自动降级为 3 秒轮询，状态点显示「实时断线，轮询中」。
+- **会话被拆成好几个**：Agent 每次调用可能换了父进程或终端；用 `--session` 或 `--session-name` 固定，或在会话卡片上重命名（重命名不改 ID）。
+- **发布跑到别的会话里**：检查环境变量里是否残留 `CODEX_THREAD_ID` / `CLAUDE_SESSION_ID` 等；显式 `--session` 永远优先。
 
 ## 自检
 
@@ -306,4 +383,4 @@ python3 ${SKILL_DIR}/scripts/server.py --port 18765
 python3 ${SKILL_DIR}/scripts/test_visual_reply.py
 ```
 
-覆盖：md/json/html 发布、auto 识别、五种画布组件元数据、前端组件存在性、artifact 接口、混合历史排序、路径穿越防护、旧版服务接管升级，以及 6 列回环拓扑的几何断言（用本机 `node` 跑 `PAGE_HTML` 里的纯几何核心，校验越界、穿模、列间距、标签叠字）。没有 `node` 时会跳过几何用例并明确报出。另含开源卫生检查：公开文件不得出现本机主目录、私人项目名或作者 handle（README/LICENSE 的安装与署名除外），并校验文档互链、`.gitignore` 与 CI 配置。
+覆盖：md/json/html 发布、auto 识别、五种画布组件元数据、前端组件存在性、artifact 接口、混合历史排序、路径穿越防护、旧版服务接管升级，6 列回环拓扑的几何断言（用本机 `node` 跑 `PAGE_HTML` 里的纯几何核心，校验越界、穿模、列间距、标签叠字）；v4 追加多会话自动检测与深链回执、8 进程并发写入（seq 单调、零丢回复、sidecar 全可解析）、SSE 实时推送 / 增量补播 / 挂连接 SIGTERM 1.5s 内退出、会话置顶重命名与路径穿越、以及工作台前端标记与「渲染逻辑只有一份」的结构断言。没有 `node` 时会跳过几何用例并明确报出。另含开源卫生检查：公开文件不得出现本机主目录、私人项目名或作者 handle（README/LICENSE 的安装与署名除外），并校验文档互链、`.gitignore` 与 CI 配置。

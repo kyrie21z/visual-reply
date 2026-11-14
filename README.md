@@ -10,7 +10,8 @@ Visual Reply is a skill for terminal/CLI coding agents. Instead of printing a 60
 answer into a scrollback buffer, the agent publishes a structured payload to
 `http://127.0.0.1:18765` and keeps only the conclusion plus a link in the terminal.
 Charts, topology maps and scorecards render in the browser; every long explanation is
-folded into a side drawer until someone clicks it.
+folded into a side drawer until someone clicks it. Run several agents at once and they
+land in separate session lanes in the same page, without stepping on each other.
 
 Runs on the Python 3.10+ standard library. No pip install, no API key, no telemetry,
 no network calls of its own.
@@ -84,15 +85,44 @@ Clicking opens an Inspector drawer on the right with full prose, code blocks and
 file list. `Esc` or `×` closes it. Hovering a node highlights its upstream and
 downstream edges.
 
+### Multi-session workbench
+
+Every publish is attributed to a session, derived with zero configuration:
+`--session` → `VISUAL_REPLY_SESSION` → the client's own thread variables
+(`ANTIGRAVITY_CONVERSATION_ID`, `CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`,
+`GEMINI_SESSION_ID`, `CLAUDE_SESSION_ID`) → terminal multiplexer pane (`WT_SESSION`,
+`TMUX_PANE`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `ITERM_SESSION_ID`) → a hash of the parent
+process and project root. Same shell stays in one lane; a different terminal gets its own.
+
+- **Session rail** — collapsible left rail sorted by pin, then recency, with a colour
+  accent, client badge, latest title, timestamp and unread count. Filter by
+  *all / unread / pinned*, or open the **global timeline** across every session.
+- **Focus lock** — the default once a session is focused (via a deep link or a click in
+  the rail). A reply from another session never hijacks the pane you are reading; it
+  marks that lane unread and shows a clickable toast instead. Switch to *follow global*
+  from the top bar when you want the newest reply to take over.
+- **Reading guard** — even inside the focused session, a new reply will not close the
+  Inspector drawer or replace a historical round you are re-reading. It shows a banner:
+  *this session has a new reply → jump to latest*.
+- **Split view** — `◫` on any session card opens a second pane. Both panes keep their own
+  session, view mode and reply history, and share one Inspector drawer.
+- **Reply rounds** — the history dropdown lists that session's rounds
+  (`#3 (latest) · title`, `#2 · title`, …) plus the legacy v3 archive.
+
+Deep links: `?session=<sid>&reply=<rid>`, plus optional `&split=<sid2>`, `&layout=h|v`
+and `&mode=lock|global`. The `url` in every publish receipt is already such a link.
+
 ### Live reload
 
-The page polls `mtime` once per second. Publishing again — to the same port and cache
-directory — refreshes the open tab with no manual reload and no scroll jump.
+`publish.py` POSTs `/api/notify` after committing, so an open tab updates in well under a
+second over Server-Sent Events. A 3-second `/api/state?since=` poll remains as a fallback
+if SSE drops. Neither causes a manual reload or a scroll jump.
 
 ### Everything else
 
 - Light / dark theme toggle, persisted per browser.
-- The last 20 publishes are archived locally and selectable from a history dropdown.
+- Every publish is archived per session and projected into the v3 `history/` layout,
+  selectable from the dropdown; the last 20 legacy entries stay addressable.
 - Old service versions are detected on the port and replaced automatically (`SIGTERM`,
   then relaunch).
 - The server binds `127.0.0.1` only.
@@ -110,19 +140,23 @@ flowchart LR
     C -->|"object with<br/>sections / nodes / cards"| D["Visual Canvas"]
     C -->|"doctype · html · svg"| E["HTML Artifact"]
     C -->|"anything else"| F["Markdown"]
-    B --> G[("cache dir<br/>latest.ext · meta.json<br/>history/")]
+    B --> G[("cache dir<br/>sessions/SID/replies<br/>state.json · feed.jsonl<br/>latest.ext · history/")]
     G --> H["server.py<br/>127.0.0.1:18765"]
     D --> H
     E --> H
     F --> H
     H --> I["Browser"]
-    I -.->|"poll mtime every 1s"| H
+    B -.->|"POST /api/notify"| H
+    H -.->|"SSE reply events"| I
+    I -.->|"3s /api/state poll fallback"| H
 ```
 
-`publish.py` is the only writer: it validates the payload, writes `latest.<ext>` and
-`meta.json` atomically, archives a copy under `history/`, starts `server.py` in the
-background if the port is idle, and prints a JSON receipt. `server.py` is stateless
-apart from the cache directory, so it can be restarted at any time.
+`publish.py` is the only writer: it resolves the session, takes an advisory lock on
+`.publish.lock`, commits the reply under `sessions/<sid>/replies/`, updates `state.json`
+and `global/feed.jsonl`, mirrors the v3 `latest.<ext>` / `meta.json` / `history/`
+projection, starts `server.py` in the background if the port is idle, then wakes SSE.
+`server.py` is stateless apart from the cache directory, so it can be restarted at any
+time.
 
 ---
 
@@ -187,20 +221,24 @@ Publish a canvas from stdin. This is a complete, runnable one-liner:
 echo '{"headline":"Plan B: 12 files, no new deps","sections":[{"type":"kpis","items":[{"label":"Files changed","value":"12","status":"ok"},{"label":"New deps","value":"0","status":"ok"},{"label":"Rollback","value":"90s","status":"warn"}]},{"type":"comparison","title":"Options","items":[{"name":"Plan A: new service","scores":{"Speed":2,"Risk":4},"cons":["New deploy target"]},{"name":"Plan B: extend the hub","badge":"Recommended","recommended":true,"scores":{"Speed":4,"Risk":2},"pros":["No new deploy target"]}]}]}' | python3 scripts/publish.py --title "Ship plan B" --stdin
 ```
 
-The receipt on stdout looks like this:
+The receipt on stdout looks like this (trimmed):
 
 ```json
 {
   "ok": true,
   "format": "json",
   "title": "Ship plan B",
-  "url": "http://127.0.0.1:18765",
+  "url": "http://127.0.0.1:18765/?session=codex-7f3a&reply=20260101-120000-000001-Ship-plan-B",
+  "session_id": "codex-7f3a",
+  "reply_id": "20260101-120000-000001-Ship-plan-B",
+  "seq": 1,
+  "session_url": "http://127.0.0.1:18765/?session=codex-7f3a",
   "server": "started",
   "browser": "xdg-open"
 }
 ```
 
-Publish again and the open tab updates in place within a second.
+Publish again and the open tab updates in place, usually in well under a second.
 
 Other entry points:
 
@@ -280,19 +318,35 @@ JSON when it parses as an object containing `sections`, `nodes` or `cards`.
 | `--no-browser` | Do not open a browser |
 | `--port` | Server port, default `18765` |
 | `--cache-dir` | Cache directory, default `~/.cache/agent-visual-reply` |
+| `--session` | Session id; skips auto-detection, rejected if unsafe |
+| `--session-name` | Human-readable session label, persisted in `session.json` |
+| `--agent` | Client badge (`codex`, `claude`, `antigravity`, …) |
 
 Cache layout:
 
 ```text
 ~/.cache/agent-visual-reply/
-├── latest.json | latest.html | latest.md   # exactly one, per payload format
-├── meta.json                               # version, format, title, mtime, chars
+├── .publish.lock                          # write lock (flock / msvcrt.locking)
+├── .server.lock                           # startup lock: one cold-start at a time
+├── state.json                             # version, seq, latest session/reply pointers
+├── sessions/
+│   └── <sid>/
+│       ├── session.json                   # label, client, project, pinned, seq, reply_count
+│       └── replies/
+│           ├── 20260101-120000-000001-title.md
+│           └── 20260101-120000-000001-title.md.meta.json
+├── global/feed.jsonl                      # append-only cross-session timeline
+├── latest.json | latest.html | latest.md  # v3 projection, exactly one per format
+├── meta.json                              # v3 projection + seq / session_id / reply_id
 ├── server.log
-└── history/
+└── history/                               # v3 projection, still read by old clients
     ├── 20260101-120000-title.json
-    ├── 20260101-120000-title.json.meta.json  # sidecar, never clashes with the payload
+    ├── 20260101-120000-title.json.meta.json
     └── 20260101-090000-older.md
 ```
+
+`reply_id` is `<stamp>-<seq:06d>-<ascii-slug>`: sortable, unique under concurrency and
+safe to drop straight into a URL.
 
 ---
 
@@ -306,7 +360,16 @@ Cache layout:
 | `GET /api/history/<filename>` | `{format, title, content, updated_at, mtime}` |
 | `GET /artifact/latest` | Raw HTML artifact, `text/html; charset=utf-8`; 404 for other formats |
 | `GET /artifact/history/<filename>` | Raw historical HTML artifact |
-| `GET /healthz` | `{ok, service, version, pid, port, cache_dir}` |
+| `GET /api/sessions` | `{version, seq, latest_session_id, sessions, legacy_count}`, pinned first then newest |
+| `GET /api/sessions/<sid>/replies?limit=200` | Reply rounds of one session, newest first |
+| `GET /api/sessions/<sid>/replies/<rid>` | `{version, session, reply, content}` |
+| `GET /api/feed?limit=50` | Cross-session timeline, including un-sessioned v3 archives |
+| `GET /api/state?since=<seq>` | Incremental events for catch-up |
+| `GET /api/events` | SSE stream (`text/event-stream`, 20 s keepalive) |
+| `POST /api/notify` | Wake SSE immediately after a publish |
+| `POST /api/sessions/<sid>` | Update `{label, pinned}` atomically |
+| `GET /artifact/session/<sid>/<rid>` | Raw HTML for one session reply |
+| `GET /healthz` | `{ok, service, version, pid, port, cache_dir, seq}` |
 
 ---
 
@@ -324,6 +387,13 @@ warnings, and the open-source hygiene scan. With `node` available it additionall
 executes the pure geometry core of the page against a six-column cyclic graph and
 asserts that nothing overflows, overlaps or clips.
 
+v4 adds: session isolation for every detection source and receipt deep-link format;
+an 8-process concurrent publish stress test across 3 sessions (all exit 0, no lost
+replies, seq `1..8`, every sidecar valid JSON); SSE connect → live push under 2 s →
+`/api/state` catch-up → `SIGTERM` under 1.5 s with a client still attached; session
+pin/rename plus traversal rejection on `/api/sessions/..` and `/artifact/session/..`;
+and structural assertions that the workbench keeps exactly one copy of each renderer.
+
 No network access is required.
 
 ---
@@ -340,6 +410,9 @@ No network access is required.
 | Wide diagram clipped | Use the *fit* button in the diagram's top-right corner (down to 0.35×) |
 | Mermaid or mind map missing | Markdown mode loads `marked`, `mermaid` and `markmap` from jsDelivr; offline it degrades to plain text. The JSON canvas needs no CDN except for Markdown inside drawers |
 | Content changed but the page did not | Publish to the same port and `--cache-dir`; the status dot should read *synced* |
+| New reply does not appear automatically | The dot shows *reconnecting* when SSE drops — a 3 s poll takes over; `/api/events` may be blocked by a proxy |
+| One agent shows up as several sessions | The parent process or terminal pane changed between calls; pin it with `--session` / `--session-name` |
+| Publish lands in the wrong session | A stale client env var (`CODEX_THREAD_ID`, `CLAUDE_SESSION_ID`, …) is present; `--session` always wins |
 
 ---
 
