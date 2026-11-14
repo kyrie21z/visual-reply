@@ -362,6 +362,40 @@ SIX_COL_GRAPH = {
     ],
 }
 
+RAIL_SESSIONS = [
+    {"id": "pin-one", "label": "alpha · codex · pin-one", "project": "alpha",
+     "client": "codex", "pinned": True, "created_at": "2025-12-31T09:00:00+00:00",
+     "created_seq": 1, "updated_at": "2026-01-02T09:00:00+00:00", "seq": 12,
+     "reply_count": 2},
+    {"id": "alpha-old", "label": "alpha · codex · alpha-", "project": "alpha",
+     "client": "codex", "pinned": False, "created_at": "2026-01-01T10:00:00+00:00",
+     "created_seq": 2, "updated_at": "2026-01-01T10:00:00+00:00", "seq": 20,
+     "reply_count": 3},
+    {"id": "beta-one", "label": "beta · codex · beta-o", "project": "beta",
+     "client": "codex", "pinned": False, "created_at": "2026-01-02T10:00:00+00:00",
+     "created_seq": 3, "updated_at": "2026-01-02T10:00:00+00:00", "seq": 30,
+     "reply_count": 1},
+    {"id": "pin-two", "label": "beta · claude · pin-two", "project": "beta",
+     "client": "claude", "pinned": True, "created_at": "2026-01-03T10:00:00+00:00",
+     "created_seq": 4, "updated_at": "2026-01-03T10:00:00+00:00", "seq": 40,
+     "reply_count": 1},
+    {"id": "alpha-new", "label": "alpha · codex · alpha-n", "project": "alpha",
+     "client": "codex", "pinned": False, "created_at": "2026-01-01T10:00:00+00:00",
+     "created_seq": 5, "updated_at": "2026-01-01T10:00:00+00:00", "seq": 50,
+     "reply_count": 1},
+]
+
+
+def rail_signature(tree: dict) -> dict:
+    pinned = (tree.get("pinned") or {}).get("sessions") or []
+    return {
+        "pinned": [s.get("id") for s in pinned],
+        "projects": [(g.get("key"), [s.get("id") for s in g.get("sessions", [])])
+                     for g in tree.get("projects", [])],
+        "totalCount": tree.get("totalCount"),
+    }
+
+
 NODE_DRIVER = r"""
 const vm = require('vm');
 const fs = require('fs');
@@ -402,6 +436,87 @@ def run_graph_core(page: str, graph: dict, workdir: Path) -> dict:
     core_path.write_text(core, encoding="utf-8")
     data_path.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
     driver_path.write_text(NODE_DRIVER, encoding="utf-8")
+
+    try:
+        proc = subprocess.run(
+            [node, str(driver_path), str(core_path), str(data_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"node 执行异常: {exc}"}
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    try:
+        return json.loads(out)
+    except ValueError:
+        err = proc.stderr.decode("utf-8", errors="replace")[:300]
+        return {"ok": False, "error": f"node 输出无法解析: {out[:200]} {err}"}
+
+
+RAIL_DRIVER = r"""
+const vm = require('vm');
+const fs = require('fs');
+
+const core = fs.readFileSync(process.argv[2], 'utf8');
+const data = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const sandbox = { console: console };
+vm.createContext(sandbox);
+try {
+  vm.runInContext(core, sandbox, { timeout: 5000 });
+} catch (err) {
+  console.log(JSON.stringify({ ok: false, error: '会话树核心执行失败: ' + err.message }));
+  process.exit(0);
+}
+const api = sandbox.RailTreeCore;
+if (!api || typeof api.buildRailTree !== 'function') {
+  console.log(JSON.stringify({ ok: false, error: '未导出 RailTreeCore.buildRailTree' }));
+  process.exit(0);
+}
+const unread = {};
+(data.unread || []).forEach(function (id) { unread[id] = 1; });
+const out = {};
+try {
+  if (data.op === 'build') {
+    out.tree = api.buildRailTree(data.sessions, {
+      filter: data.filter || 'all',
+      unreadCountOf: function (s) { return Number(unread[s.id] || 0); }
+    });
+  } else if (data.op === 'compare') {
+    out.order = (data.sessions || []).slice().sort(api.compareSessionsFixed)
+      .map(function (s) { return s.id; });
+  } else if (data.op === 'strip') {
+    out.values = (data.sessions || []).map(function (s) { return api.stripProjectPrefix(s); });
+  } else if (data.op === 'replies') {
+    out.order = api.sortRepliesDesc(data.replies || []).map(function (r) { return r.reply_id; });
+  } else if (data.op === 'parse') {
+    out.values = (data.sessions || []).map(function (s) { return api.parseCreatedMs(s); });
+  } else {
+    out.error = 'unknown op';
+  }
+} catch (err) {
+  console.log(JSON.stringify({ ok: false, error: 'RailTreeCore 执行失败: ' + err.message }));
+  process.exit(0);
+}
+console.log(JSON.stringify({ ok: true, result: out }));
+"""
+
+
+def run_rail_core(page: str, payload: dict, workdir: Path) -> dict:
+    """抽出 PAGE_HTML 里的纯会话树核心，在本机 node 的 vm 沙箱里实跑。"""
+    node = shutil.which("node")
+    if not node:
+        return {"ok": False, "error": "node 未安装，无法跑会话树断言"}
+    start = "/* ==== VR_RAIL_CORE_START ==== */"
+    end = "/* ==== VR_RAIL_CORE_END ==== */"
+    if start not in page or end not in page:
+        return {"ok": False, "error": "PAGE_HTML 缺少会话树核心标记"}
+    core = page.split(start, 1)[1].split(end, 1)[0]
+
+    core_path = workdir / "rail_core.js"
+    data_path = workdir / "rail_payload.json"
+    driver_path = workdir / "rail_driver.js"
+    core_path.write_text(core, encoding="utf-8")
+    data_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    driver_path.write_text(RAIL_DRIVER, encoding="utf-8")
 
     try:
         proc = subprocess.run(
@@ -617,6 +732,7 @@ def main() -> int:
     geo_dir = Path(tempfile.mkdtemp(prefix="vr-geo-")).resolve()
     stress_cache = Path(tempfile.mkdtemp(prefix="vr-stress-")).resolve()
     cold_cache = Path(tempfile.mkdtemp(prefix="vr-cold-")).resolve()
+    store_cache = Path(tempfile.mkdtemp(prefix="vr-store-")).resolve()
     used_ports: set[int] = set()
     port = unique_port(used_ports)
     port_v1 = unique_port(used_ports)
@@ -1319,19 +1435,44 @@ def main() -> int:
         check("兜底会话 source 为 fallback:ppid",
               fallback_rec.get("source") == "fallback:ppid", str(fallback_rec.get("source")))
 
+        older_file = cache / "sessions" / "conv-alpha" / "session.json"
+        newer_file = cache / "sessions" / "team-x" / "session.json"
+        older_before = json.loads(older_file.read_text("utf-8"))
+        newer_rec = json.loads(newer_file.read_text("utf-8"))
+        check("新会话写入递增的 created_seq",
+              int(older_before.get("created_seq") or 0) > 0
+              and int(newer_rec.get("created_seq") or 0)
+              > int(older_before.get("created_seq") or 0),
+              f'{older_before.get("created_seq")} / {newer_rec.get("created_seq")}')
+
+        code, older_reply = publish(port, cache, MD, "旧会话追加回复",
+                                    env=clean_env(ANTIGRAVITY_CONVERSATION_ID="conv-alpha"))
+        check("旧会话追加回复成功", code == 0 and older_reply.get("ok") is True, str(older_reply))
+        older_after = json.loads(older_file.read_text("utf-8"))
+        check("created_seq 跨后续回复保持不变",
+              older_after.get("created_seq") == older_before.get("created_seq"),
+              f'{older_after.get("created_seq")} != {older_before.get("created_seq")}')
+        check("created_at 跨后续回复保持不变",
+              older_after.get("created_at") == older_before.get("created_at"),
+              f'{older_after.get("created_at")} != {older_before.get("created_at")}')
+
         status, sessions_payload = get_json(f"{base}/api/sessions")
         check("GET /api/sessions 返回 200", status == 200, str(status))
-        check("sessions 版本为 4", sessions_payload.get("version") == EXPECTED_VERSION,
+        check(f"sessions 版本为 {EXPECTED_VERSION}", sessions_payload.get("version") == EXPECTED_VERSION,
               str(sessions_payload.get("version")))
         listed = {s.get("id"): s for s in sessions_payload.get("sessions", [])}
         check("会话列表包含全部新建会话",
               {"conv-alpha", "thread-9", "ses_open_1", "gem-1", "repl-7", "team-x"} <= set(listed),
               str(sorted(listed)))
-        check("会话列表按 seq 倒序",
-              all(int(sessions_payload["sessions"][i]["seq"])
-                  >= int(sessions_payload["sessions"][i + 1]["seq"])
+        check("会话列表按固定创建顺序倒序",
+              all(int(sessions_payload["sessions"][i].get("created_seq") or 0)
+                  >= int(sessions_payload["sessions"][i + 1].get("created_seq") or 0)
                   for i in range(len(sessions_payload["sessions"]) - 1)),
-              str([s.get("seq") for s in sessions_payload.get("sessions", [])]))
+              str([s.get("created_seq") for s in sessions_payload.get("sessions", [])]))
+        listed_order = [s.get("id") for s in sessions_payload.get("sessions", [])]
+        check("旧会话收到新回复后仍排在新会话之后",
+              listed_order.index("team-x") < listed_order.index("conv-alpha"),
+              str(listed_order))
         check("会话列表含 legacy_count 汇总", "legacy_count" in sessions_payload,
               str(sessions_payload.get("legacy_count")))
 
@@ -1659,6 +1800,12 @@ def main() -> int:
 
         for token in ("new EventSource('/api/events')", "URLSearchParams",
                       "history.replaceState", "popstate", "vr.lastSeen",
+                      "vr.collapsedGroups", "vr.expandedSessions",
+                      "VR_RAIL_CORE_START", "VR_RAIL_CORE_END", "RailTreeCore",
+                      "buildRailTree", "compareSessionsFixed", "sortRepliesDesc",
+                      "stripProjectPrefix", "rail-group-head", "rail-group-pinned",
+                      "rail-replies", "rail-reply", "rail-reply-hint",
+                      "rail-project-pill", "aria-expanded",
                       "锁定会话", "跟随全局", "本会话有新回复", "切到最新",
                       "全局时间线", "未读", "置顶", "分屏", "data-filter=",
                       "/api/sessions/", "/api/state?since=", "/api/feed",
@@ -1668,6 +1815,119 @@ def main() -> int:
                       "pane.name === 'primary') closeDrawer();",
                       "'(' + unread + ') '", "setTimeout(function () {"):
             check(f"页面包含 {token}", token in page)
+
+        check("会话树容器带 role=tree",
+              'id="rail-list" role="tree"' in page, page[page.find('id="rail-list"'):][:80])
+        check("会话节点声明 treeitem 层级",
+              "card.setAttribute('role', 'treeitem')" in page
+              and "card.setAttribute('aria-level', '2')" in page
+              and "item.setAttribute('aria-level', '3')" in page)
+
+        print("\n[16b] 会话树核心（Node VM）")
+        rail_result = run_rail_core(
+            page, {"op": "build", "sessions": RAIL_SESSIONS, "unread": ["alpha-old"]}, geo_dir)
+        tree = (rail_result.get("result") or {}).get("tree") if rail_result.get("ok") else None
+        check("会话树核心可在 node vm 中执行", bool(tree), str(rail_result.get("error")))
+
+        if tree:
+            pinned_ids = [s.get("id") for s in (tree.get("pinned") or {}).get("sessions", [])]
+            project_ids = [s.get("id") for g in tree.get("projects", [])
+                           for s in g.get("sessions", [])]
+            check("置顶会话单独成组且按创建顺序固定",
+                  pinned_ids == ["pin-two", "pin-one"], str(pinned_ids))
+            check("置顶会话不会重复出现在项目组",
+                  not (set(pinned_ids) & set(project_ids)), str(project_ids))
+            check("非置顶会话按 project 分组",
+                  [(g.get("key"), [s.get("id") for s in g.get("sessions", [])])
+                   for g in tree.get("projects", [])]
+                  == [("beta", ["beta-one"]), ("alpha", ["alpha-new", "alpha-old"])],
+                  str([(g.get("key"), [s.get("id") for s in g.get("sessions", [])])
+                       for g in tree.get("projects", [])]))
+            check("tree.totalCount 等于匹配会话数",
+                  tree.get("totalCount") == len(RAIL_SESSIONS), str(tree.get("totalCount")))
+            check("项目组按组内最新创建顺序排列",
+                  [g.get("key") for g in tree.get("projects", [])] == ["beta", "alpha"],
+                  str([g.get("key") for g in tree.get("projects", [])]))
+            alpha_group = next(g for g in tree["projects"] if g["key"] == "alpha")
+            check("项目内按 created_at / created_seq 倒序",
+                  [s["id"] for s in alpha_group["sessions"]] == ["alpha-new", "alpha-old"],
+                  str([s["id"] for s in alpha_group["sessions"]]))
+
+            baseline = rail_signature(tree)
+            mutated = json.loads(json.dumps(RAIL_SESSIONS))
+            for session in mutated:
+                if session["id"] == "alpha-old":
+                    session["updated_at"] = "2031-01-01T00:00:00+00:00"
+                    session["seq"] = 999
+            mutated_result = run_rail_core(
+                page, {"op": "build", "sessions": mutated, "unread": ["alpha-old"]}, geo_dir)
+            mutated_tree = ((mutated_result.get("result") or {}).get("tree")
+                            if mutated_result.get("ok") else None)
+            check("旧会话收到新回复后会话与项目位置不变",
+                  bool(mutated_tree) and rail_signature(mutated_tree) == baseline,
+                  f"{rail_signature(mutated_tree or {})} != {baseline}")
+            if mutated_tree:
+                alpha_after = next(g for g in mutated_tree["projects"] if g["key"] == "alpha")
+                check("项目 newestCreatedSeq 不被回复 seq 污染",
+                      alpha_after.get("newestCreatedSeq") == 5,
+                      str(alpha_after.get("newestCreatedSeq")))
+
+            compare_result = run_rail_core(page, {"op": "compare", "sessions": mutated}, geo_dir)
+            check("compareSessionsFixed 忽略 updated_at / seq",
+                  (compare_result.get("result") or {}).get("order")
+                  == ["pin-two", "beta-one", "alpha-new", "alpha-old", "pin-one"],
+                  str(compare_result))
+
+        strip_result = run_rail_core(page, {"op": "strip", "sessions": [
+            {"id": "a", "project": "alpha", "label": "alpha · codex · abcdef",
+             "custom_label": False},
+            {"id": "b", "project": "alpha", "label": "alpha · 自定义名", "custom_label": True},
+            {"id": "c", "label": "独立会话"},
+        ]}, geo_dir)
+        check("stripProjectPrefix 去掉默认项目前缀且保留自定义名",
+              (strip_result.get("result") or {}).get("values")
+              == ["codex · abcdef", "alpha · 自定义名", "独立会话"],
+              str(strip_result))
+
+        replies_result = run_rail_core(page, {"op": "replies", "replies": [
+            {"reply_id": "r1", "seq": 1},
+            {"reply_id": "r2", "seq": 3},
+            {"reply_id": "r3", "seq": 2},
+        ]}, geo_dir)
+        check("sortRepliesDesc 把最新回复放在 index 0",
+              (replies_result.get("result") or {}).get("order") == ["r2", "r3", "r1"],
+              str(replies_result))
+
+        parse_result = run_rail_core(page, {"op": "parse", "sessions": [
+            {"created_at": "2026-01-01T00:00:00Z"},
+            {"updated_at": "2026-01-02T00:00:00Z"},
+            {},
+        ]}, geo_dir)
+        check("parseCreatedMs 解析 Z 后缀并回退 updated_at",
+              (parse_result.get("result") or {}).get("values")
+              == [1767225600000, 1767312000000, 0],
+              str(parse_result))
+
+        unread_result = run_rail_core(page, {
+            "op": "build", "sessions": RAIL_SESSIONS,
+            "unread": ["alpha-old"], "filter": "unread"}, geo_dir)
+        unread_tree = ((unread_result.get("result") or {}).get("tree")
+                       if unread_result.get("ok") else None)
+        check("unread 筛选只保留未读会话",
+              bool(unread_tree) and unread_tree.get("totalCount") == 1
+              and [(g.get("key"), [s.get("id") for s in g.get("sessions", [])])
+                   for g in unread_tree.get("projects", [])] == [("alpha", ["alpha-old"])],
+              str(unread_tree))
+
+        pinned_result = run_rail_core(page, {
+            "op": "build", "sessions": RAIL_SESSIONS, "filter": "pinned"}, geo_dir)
+        pinned_tree = ((pinned_result.get("result") or {}).get("tree")
+                       if pinned_result.get("ok") else None)
+        check("pinned 筛选只返回置顶组",
+              bool(pinned_tree) and pinned_tree.get("totalCount") == 2
+              and not pinned_tree.get("projects")
+              and [s.get("id") for s in (pinned_tree.get("pinned") or {}).get("sessions", [])]
+              == ["pin-two", "pin-one"], str(pinned_tree))
 
         check("Markdown 渲染逻辑只有一份",
               page.count("function renderReading(") == 1, str(page.count("function renderReading(")))
@@ -1684,8 +1944,83 @@ def main() -> int:
               "其它会话只提示，不跳转" in page or "不劫持" in page
               or "锁定当前会话" in page)
 
+        # ---------- 17. 存储层 created_seq 与固定排序 ----------
+        print("\n[17] 存储层 created_seq 与固定排序")
+        spec = importlib.util.spec_from_file_location("vr_store_rail", STORE)
+        store_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(store_module)
+
+        check("_iso_epoch 支持 Z 后缀",
+              store_module._iso_epoch("2026-01-01T00:00:00Z") == 1767225600.0,
+              str(store_module._iso_epoch("2026-01-01T00:00:00Z")))
+        check("_iso_epoch 非法输入回退 0", store_module._iso_epoch("not-a-time") == 0.0)
+
+        legacy_dir = store_cache / "sessions" / "legacy-1"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "session.json").write_text(json.dumps({
+            "id": "legacy-1", "label": "legacy · codex · legacy", "client": "codex",
+            "project": "legacy", "source": "explicit", "pinned": False,
+            "seq": 7, "reply_count": 1,
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "updated_at": "2025-01-02T00:00:00+00:00",
+        }, ensure_ascii=False), encoding="utf-8")
+        legacy_seed = {
+            "id": "legacy-1", "label": "legacy · codex · legacy", "custom_label": False,
+            "client": "codex", "project": "legacy", "source": "explicit",
+            "color": "#2f6feb",
+        }
+        fresh_seed = {
+            "id": "fresh-1", "label": "legacy · codex · fresh", "custom_label": False,
+            "client": "codex", "project": "legacy", "source": "explicit",
+            "color": "#0891b2",
+        }
+        with store_module.cache_lock(store_cache):
+            store_module.commit_reply(store_cache, legacy_seed, "# 旧会话\n", "md", "旧会话")
+        legacy_rec = json.loads((legacy_dir / "session.json").read_text("utf-8"))
+        check("v4 旧会话补写 created_seq=0", legacy_rec.get("created_seq") == 0,
+              str(legacy_rec.get("created_seq")))
+
+        with store_module.cache_lock(store_cache):
+            fresh = store_module.commit_reply(
+                store_cache, fresh_seed, "# 新会话\n", "md", "新会话")
+            store_module.commit_reply(
+                store_cache, legacy_seed, "# 旧会话续写\n", "md", "旧会话续写")
+        fresh_rec = json.loads((store_cache / "sessions" / "fresh-1" / "session.json").read_text("utf-8"))
+        legacy_rec2 = json.loads((legacy_dir / "session.json").read_text("utf-8"))
+        check("新会话 created_seq 等于首次 seq",
+              fresh_rec.get("created_seq") == fresh.get("seq"),
+              f'{fresh_rec.get("created_seq")} != {fresh.get("seq")}')
+        check("旧会话续写仍保持 created_seq=0", legacy_rec2.get("created_seq") == 0,
+              str(legacy_rec2.get("created_seq")))
+        ordered_unpinned = [s["id"] for s in store_module.list_sessions(store_cache)]
+        check("list_sessions 固定创建顺序（旧会话续写不超越新会话）",
+              ordered_unpinned == ["fresh-1", "legacy-1"], str(ordered_unpinned))
+
+        with store_module.cache_lock(store_cache):
+            store_module.update_session(store_cache, "legacy-1", pinned=True)
+        ordered_pinned = [s["id"] for s in store_module.list_sessions(store_cache)]
+        check("list_sessions 置顶优先", ordered_pinned[0] == "legacy-1", str(ordered_pinned))
+        with store_module.cache_lock(store_cache):
+            store_module.update_session(store_cache, "legacy-1", pinned=False)
+
+        # 在运行中的 HTTP 服务上验证：早先创建的非置顶会话收到新回复后，不会超越后创建的非置顶会话
+        code, fixed_old = publish(port, cache, MD, "固定顺序旧会话",
+                                  env=clean_env(CODEX_THREAD_ID="fixed-older"))
+        time.sleep(0.05)
+        code2, fixed_new = publish(port, cache, MD, "固定顺序新会话",
+                                   env=clean_env(CODEX_THREAD_ID="fixed-newer"))
+        check("固定顺序对照会话创建成功", code == 0 and code2 == 0)
+        publish(port, cache, MD, "固定顺序旧会话后续新回复",
+                env=clean_env(CODEX_THREAD_ID="fixed-older"))
+        status, fixed_payload = get_json(f"{base}/api/sessions")
+        non_pinned_ids = [s.get("id") for s in fixed_payload.get("sessions", []) if not s.get("pinned")]
+        check("/api/sessions 非置顶新会话保持在旧会话之前",
+              status == 200 and "fixed-newer" in non_pinned_ids and "fixed-older" in non_pinned_ids
+              and non_pinned_ids.index("fixed-newer") < non_pinned_ids.index("fixed-older"),
+              str(non_pinned_ids))
+
     finally:
-        print("\n[17] 清理")
+        print("\n[18] 清理")
         if fake_proc is not None and fake_proc.poll() is None:
             fake_proc.kill()
             fake_proc.wait(timeout=5)
@@ -1700,11 +2035,11 @@ def main() -> int:
                   and wait_port_closed(stress_port) and wait_port_closed(cold_port))
         check("测试服务已关闭", closed,
               f"端口 {port} / {port_v1} / {stress_port} / {cold_port} 仍可连接")
-        for path in (cache, cache_v1, geo_dir, stress_cache, cold_cache):
+        for path in (cache, cache_v1, geo_dir, stress_cache, cold_cache, store_cache):
             shutil.rmtree(path, ignore_errors=True)
         check("临时目录已清理",
-              not any(p.exists() for p in (cache, cache_v1, geo_dir, stress_cache, cold_cache)),
-              f"{cache} / {cache_v1} / {geo_dir} / {stress_cache} / {cold_cache}")
+              not any(p.exists() for p in (cache, cache_v1, geo_dir, stress_cache, cold_cache, store_cache)),
+              f"{cache} / {cache_v1} / {geo_dir} / {stress_cache} / {cold_cache} / {store_cache}")
 
     total = PASSED + len(FAILED)
     print(f"\n结果: {PASSED}/{total} 通过")

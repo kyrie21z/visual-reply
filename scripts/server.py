@@ -48,7 +48,7 @@ import vr_store  # noqa: E402  - 保证按路径加载时也能 import
 DEFAULT_PORT = 18765
 DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
-VERSION = 4
+VERSION = 5
 HISTORY_LIMIT = 20
 REPLY_LIMIT = 200
 FEED_LIMIT = 50
@@ -431,7 +431,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 /* ---------- v4 Workbench：会话栏 / 分屏 / 阅读守卫 ---------- */
 #shell { flex: 1 1 auto; display: flex; min-height: 0; min-width: 0; }
 #session-rail {
-  flex: 0 0 272px; display: flex; flex-direction: column; min-height: 0;
+  flex: 0 0 296px; display: flex; flex-direction: column; min-height: 0;
   background: var(--bg-elev); border-right: 1px solid var(--border);
   transition: flex-basis .18s ease;
 }
@@ -447,13 +447,20 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 .rail-list { flex: 1 1 auto; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
 .rail-empty { padding: 26px 12px; text-align: center; font-size: 12px; color: var(--fg-muted); line-height: 1.6; }
 .rail-card {
-  position: relative; display: flex; gap: 8px; padding: 8px 9px 8px 12px;
+  position: relative; display: flex; align-items: flex-start; gap: 6px; padding: 8px 9px 8px 11px;
   border: 1px solid var(--border); border-radius: 11px; background: var(--bg-soft);
   cursor: pointer; transition: border-color .15s, background .15s;
 }
 .rail-card:hover { border-color: var(--accent); }
 .rail-card[data-active="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.rail-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .rail-accent { position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px; border-radius: 0 3px 3px 0; }
+.rail-caret {
+  flex: 0 0 auto; width: 16px; height: 16px; padding: 0; margin-top: 1px;
+  border: 0; background: transparent; color: var(--fg-muted);
+  font-size: 9.5px; line-height: 16px; text-align: center; border-radius: 4px;
+}
+.rail-caret:hover { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 .rail-main { min-width: 0; flex: 1 1 auto; padding-right: 26px; }
 .rail-top { display: flex; align-items: center; gap: 6px; }
 .rail-label { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -472,6 +479,68 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 .rail-actions { position: absolute; right: 6px; bottom: 5px; display: none; gap: 2px; }
 .rail-card:hover .rail-actions { display: flex; }
 .rail-actions button { padding: 1px 6px; font-size: 10.5px; line-height: 1.5; border-radius: 6px; background: var(--bg-elev); }
+.rail-project-pill {
+  flex: 0 1 auto; max-width: 88px; padding: 0 6px;
+  font-size: 9.5px; font-weight: 600; line-height: 15px; color: var(--fg-muted);
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 999px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.rail-group { display: flex; flex-direction: column; gap: 2px; }
+.rail-group + .rail-group { margin-top: 2px; }
+.rail-group-head {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 5px 7px; border: 0; background: transparent; border-radius: 8px;
+  color: var(--fg-muted); text-align: left; font-size: 11px; font-weight: 650;
+  letter-spacing: .02em; cursor: pointer;
+}
+.rail-group-head:hover { color: var(--fg); background: var(--bg-soft); border-color: transparent; }
+.rail-group-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+.rail-chevron { flex: 0 0 auto; width: 12px; font-size: 9px; text-align: center; opacity: .85; }
+.rail-group-label { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rail-group-pinned .rail-group-label { color: var(--warn); }
+.rail-group-count {
+  flex: 0 0 auto; padding: 0 6px; font-size: 10px; font-weight: 600;
+  color: var(--fg-muted); background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 999px; line-height: 15px;
+}
+.rail-group-unread {
+  flex: 0 0 auto; min-width: 15px; height: 15px; padding: 0 4px;
+  border-radius: 999px; background: var(--err); color: #fff;
+  font-size: 9.5px; font-weight: 650; line-height: 15px; text-align: center;
+}
+.rail-group-body {
+  display: flex; flex-direction: column; gap: 5px;
+  margin-left: 12px; padding-left: 9px; border-left: 1px solid var(--border);
+}
+.rail-node { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rail-replies {
+  display: flex; flex-direction: column; gap: 2px;
+  margin: 1px 0 3px 20px; padding: 3px 0 3px 9px;
+  border-left: 2px solid var(--border-strong);
+}
+.rail-reply {
+  position: relative; display: flex; align-items: center; gap: 6px; min-width: 0;
+  padding: 4px 6px 4px 7px; border: 1px solid transparent; border-radius: 7px;
+  cursor: pointer; transition: background .15s, border-color .15s;
+}
+.rail-reply:hover { background: var(--bg-soft); border-color: var(--border); }
+.rail-reply[data-active="true"] {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.rail-reply:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+.rail-reply-num { flex: 0 0 auto; font-size: 10px; font-variant-numeric: tabular-nums; color: var(--fg-muted); }
+.rail-reply-main { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 1px; }
+.rail-reply-line { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.rail-reply-title { flex: 1 1 auto; min-width: 0; font-size: 11.5px; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rail-reply-tag {
+  flex: 0 0 auto; padding: 0 5px; border-radius: 999px;
+  font-size: 9px; font-weight: 650; line-height: 14px;
+  color: var(--accent); background: var(--accent-soft);
+}
+.rail-reply-meta { font-size: 9.5px; color: var(--fg-muted); opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rail-reply-unread { flex: 0 0 auto; width: 5px; height: 5px; border-radius: 50%; background: var(--err); }
+.rail-reply-hint { padding: 4px 7px; font-size: 10.5px; color: var(--fg-muted); opacity: .8; }
 .rail-foot { padding: 8px 10px; border-top: 1px solid var(--border); }
 .rail-foot button { width: 100%; }
 .feed-item {
@@ -525,7 +594,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 .pane-mindmap-svg { display: block; width: 100%; height: 100%; }
 #pane-secondary .markdown-body { padding: 24px 30px 120px; }
 @media (max-width: 900px) {
-  #session-rail { flex-basis: 210px; }
+  #session-rail { flex-basis: 244px; }
   .pane-bar .doc { display: none; }
   #stage[data-split="h"] { flex-direction: column; }
   #stage[data-split="h"] #pane-secondary { border-left: 0; border-top: 1px solid var(--border-strong); }
@@ -569,7 +638,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
         <button type="button" data-filter="pinned">置顶</button>
       </div>
     </div>
-    <div class="rail-list" id="rail-list"></div>
+    <div class="rail-list" id="rail-list" role="tree" aria-label="项目 · 会话 · 回复"></div>
     <div class="rail-list" id="feed-list" hidden></div>
     <div class="rail-foot">
       <button type="button" id="feed-btn">全局时间线</button>
@@ -682,15 +751,24 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     latestSessionId: '',
     latestReplyId: '',
     lastSeen: {},
+    collapsedGroups: {},
+    expandedSessions: {},
+    loadingReplies: {},
     pendingBanner: null,
     sse: null,
     polling: false
   };
-  try {
-    app.lastSeen = JSON.parse(localStorage.getItem('vr.lastSeen') || '{}') || {};
-  } catch (err) {
-    app.lastSeen = {};
+  function readStoredMap(key) {
+    try {
+      var value = JSON.parse(localStorage.getItem(key) || '{}');
+      return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    } catch (err) {
+      return {};
+    }
   }
+  app.lastSeen = readStoredMap('vr.lastSeen');
+  app.collapsedGroups = readStoredMap('vr.collapsedGroups');
+  app.expandedSessions = readStoredMap('vr.expandedSessions');
 
   var drawer = $('#drawer');
   var mmdSeq = 0;
@@ -1656,6 +1734,122 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   })();
   /* ==== VR_GRAPH_CORE_END ==== */
 
+/* ==== VR_RAIL_CORE_START ==== */
+  /* 纯数据变换，不依赖 DOM；test_visual_reply.py 会把这段抽出来在 node vm 里跑。 */
+  var RailTreeCore = (function () {
+    'use strict';
+
+    function parseCreatedMs(session) {
+      return Date.parse(session && (session.created_at || session.updated_at) || '') || 0;
+    }
+
+    /* 固定创建顺序：不读 updated_at / seq，会话收到新回复时位置不变。 */
+    function compareSessionsFixed(a, b) {
+      return (parseCreatedMs(b) - parseCreatedMs(a)) ||
+        (Number(b.created_seq || 0) - Number(a.created_seq || 0)) ||
+        String(b.id || '').localeCompare(String(a.id || ''));
+    }
+
+    function stripProjectPrefix(session) {
+      if (!session) return '';
+      var project = session.project;
+      if (!session.custom_label && project) {
+        var prefix = String(project) + ' · ';
+        if (String(session.label || '').indexOf(prefix) === 0) {
+          return String(session.label || '').slice(prefix.length);
+        }
+      }
+      return session.label || session.id || '';
+    }
+
+    /* 最新 #N 永远排第一。 */
+    function sortRepliesDesc(replies) {
+      return (replies || []).slice().sort(function (a, b) {
+        return (Number(b.seq || 0) - Number(a.seq || 0)) ||
+          String(b.reply_id || '').localeCompare(String(a.reply_id || ''));
+      });
+    }
+
+    function projectKeyOf(session) {
+      return String(session.project || 'workspace').trim() || 'workspace';
+    }
+
+    function buildRailTree(sessions, opts) {
+      opts = opts || {};
+      var filter = opts.filter || 'all';
+      var unreadCountOf = opts.unreadCountOf || function () { return 0; };
+
+      var filtered = (sessions || []).slice().filter(function (s) {
+        if (!s) return false;
+        if (filter === 'unread') return unreadCountOf(s) > 0;
+        if (filter === 'pinned') return !!s.pinned;
+        return true;
+      });
+
+      var pinnedSessions = filtered.filter(function (s) { return !!s.pinned; });
+      pinnedSessions.sort(compareSessionsFixed);
+
+      var pinnedGroup = null;
+      if (pinnedSessions.length) {
+        var pinnedUnread = 0;
+        pinnedSessions.forEach(function (s) { pinnedUnread += unreadCountOf(s); });
+        pinnedGroup = {
+          kind: 'pinned',
+          key: '__pinned__',
+          label: '置顶',
+          sessions: pinnedSessions,
+          unreadTotal: pinnedUnread
+        };
+      }
+
+      var groups = {};
+      filtered.forEach(function (s) {
+        if (s.pinned) return;
+        var key = projectKeyOf(s);
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(s);
+      });
+
+      var projects = Object.keys(groups).map(function (key) {
+        var rows = groups[key].slice().sort(compareSessionsFixed);
+        var newestCreatedMs = 0;
+        var newestCreatedSeq = 0;
+        var unreadTotal = 0;
+        rows.forEach(function (s) {
+          newestCreatedMs = Math.max(newestCreatedMs, parseCreatedMs(s));
+          newestCreatedSeq = Math.max(newestCreatedSeq, Number(s.created_seq || 0));
+          unreadTotal += unreadCountOf(s);
+        });
+        return {
+          kind: 'project',
+          key: key,
+          label: key,
+          sessions: rows,
+          newestCreatedMs: newestCreatedMs,
+          newestCreatedSeq: newestCreatedSeq,
+          unreadTotal: unreadTotal
+        };
+      });
+
+      projects.sort(function (a, b) {
+        return compareSessionsFixed(a.sessions[0], b.sessions[0]) ||
+          a.key.localeCompare(b.key);
+      });
+
+      return { pinned: pinnedGroup, projects: projects, totalCount: filtered.length };
+    }
+
+    return {
+      parseCreatedMs: parseCreatedMs,
+      compareSessionsFixed: compareSessionsFixed,
+      stripProjectPrefix: stripProjectPrefix,
+      buildRailTree: buildRailTree,
+      sortRepliesDesc: sortRepliesDesc
+    };
+  })();
+  (typeof globalThis !== 'undefined' ? globalThis : this).RailTreeCore = RailTreeCore;
+  /* ==== VR_RAIL_CORE_END ==== */
+
   function renderGraph(pane, sec) {
     var nodes = (Array.isArray(sec.nodes) ? sec.nodes : []).filter(function (n) {
       return n && n.id !== undefined && n.id !== null;
@@ -2118,11 +2312,186 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     return btn;
   }
 
-  function sessionCard(session) {
+  function saveRailState() {
+    try {
+      localStorage.setItem('vr.collapsedGroups', JSON.stringify(app.collapsedGroups));
+      localStorage.setItem('vr.expandedSessions', JSON.stringify(app.expandedSessions));
+    } catch (err) { /* ignore */ }
+  }
+
+  function railProjectKey(session) {
+    return String((session && session.project) || 'workspace').trim() || 'workspace';
+  }
+
+  function railGroupKey(session) {
+    return session.pinned ? '__pinned__' : railProjectKey(session);
+  }
+
+  /* 显式展开状态优先；未记录时只有当前焦点会话默认展开。 */
+  function isSessionExpanded(sessionId) {
+    if (Object.prototype.hasOwnProperty.call(app.expandedSessions, sessionId)) {
+      return !!app.expandedSessions[sessionId];
+    }
+    return panes.primary.sessionId === sessionId;
+  }
+
+  function railGroupHead(group, pinned) {
+    var collapsed = !!app.collapsedGroups[group.key];
+    var head = document.createElement('button');
+    head.type = 'button';
+    head.className = 'rail-group-head';
+    head.dataset.groupKey = group.key;
+    head.setAttribute('aria-expanded', String(!collapsed));
+
+    var chevron = document.createElement('span');
+    chevron.className = 'rail-chevron';
+    chevron.textContent = collapsed ? '▸' : '▾';
+    head.appendChild(chevron);
+
+    var label = document.createElement('span');
+    label.className = 'rail-group-label';
+    label.textContent = pinned ? '★ ' + group.label : group.label;
+    head.appendChild(label);
+
+    var count = document.createElement('span');
+    count.className = 'rail-group-count';
+    count.textContent = String(group.sessions.length);
+    head.appendChild(count);
+
+    if (group.unreadTotal > 0) {
+      var unread = document.createElement('span');
+      unread.className = 'rail-group-unread';
+      unread.textContent = group.unreadTotal > 9 ? '9+' : String(group.unreadTotal);
+      unread.title = group.unreadTotal + ' 条未读';
+      head.appendChild(unread);
+    }
+
+    head.addEventListener('click', function () {
+      if (collapsed) delete app.collapsedGroups[group.key];
+      else app.collapsedGroups[group.key] = true;
+      saveRailState();
+      renderRail();
+    });
+    return head;
+  }
+
+  function railReplyHint(text) {
+    var hint = document.createElement('div');
+    hint.className = 'rail-reply-hint';
+    hint.textContent = text;
+    return hint;
+  }
+
+  function sessionReplies(session) {
+    var box = document.createElement('div');
+    box.className = 'rail-replies';
+    box.setAttribute('role', 'group');
+    box.dataset.sid = session.id;
+
+    var rows = app.replies[session.id];
+    if (!rows) {
+      box.appendChild(railReplyHint('加载回复中…'));
+      if (!app.loadingReplies[session.id]) {
+        loadSessionReplies(session.id, false).then(function () { renderRail(); });
+      }
+      return box;
+    }
+
+    var ordered = RailTreeCore.sortRepliesDesc(rows);
+    if (!ordered.length) {
+      box.appendChild(railReplyHint('暂无回复'));
+      return box;
+    }
+
+    var total = ordered.length;
+    ordered.forEach(function (row, index) {
+      var number = total - index;
+      var unread = Number(row.seq || 0) > Number(app.lastSeen[session.id] || 0);
+
+      var item = document.createElement('div');
+      item.className = 'rail-reply';
+      item.dataset.sid = session.id;
+      item.dataset.rid = row.reply_id;
+      item.dataset.active = String(
+        panes.primary.sessionId === session.id && panes.primary.replyId === row.reply_id);
+      item.dataset.unread = String(unread);
+      item.setAttribute('role', 'treeitem');
+      item.setAttribute('aria-level', '3');
+      item.tabIndex = 0;
+      item.title = '#' + number + ' · ' + (row.title || row.reply_id || '');
+
+      var num = document.createElement('span');
+      num.className = 'rail-reply-num';
+      num.textContent = '#' + number;
+      item.appendChild(num);
+
+      var main = document.createElement('span');
+      main.className = 'rail-reply-main';
+      var line = document.createElement('span');
+      line.className = 'rail-reply-line';
+      var title = document.createElement('span');
+      title.className = 'rail-reply-title';
+      title.textContent = row.title || row.reply_id || '未命名回复';
+      line.appendChild(title);
+      if (index === 0) {
+        var tag = document.createElement('span');
+        tag.className = 'rail-reply-tag';
+        tag.textContent = '最新';
+        line.appendChild(tag);
+      }
+      main.appendChild(line);
+      var meta = document.createElement('span');
+      meta.className = 'rail-reply-meta';
+      meta.textContent = String(row.format || 'md').toUpperCase() +
+        ' · ' + fmtTime(row.updated_at || row.created_at);
+      main.appendChild(meta);
+      item.appendChild(main);
+
+      if (unread) {
+        var dot = document.createElement('span');
+        dot.className = 'rail-reply-unread';
+        dot.title = '未读';
+        item.appendChild(dot);
+      }
+
+      function openReply(ev) {
+        if (ev) ev.stopPropagation();
+        closeDrawer();
+        if (panes.primary.sessionId === session.id) {
+          loadReply(panes.primary, session.id, row.reply_id);
+        } else {
+          focusSession(session.id, { reply: row.reply_id });
+        }
+      }
+      item.addEventListener('click', openReply);
+      item.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          openReply(ev);
+        }
+      });
+      box.appendChild(item);
+    });
+    return box;
+  }
+
+  function sessionTreeNode(session, opts) {
+    opts = opts || {};
+    var inPinned = !!opts.inPinned;
+    var expanded = isSessionExpanded(session.id);
+
+    var node = document.createElement('div');
+    node.className = 'rail-node';
+    node.dataset.sid = session.id;
+
     var card = document.createElement('div');
     card.className = 'rail-card';
     card.dataset.sid = session.id;
     card.dataset.active = String(panes.primary.sessionId === session.id);
+    card.setAttribute('role', 'treeitem');
+    card.setAttribute('aria-level', '2');
+    card.setAttribute('aria-expanded', String(expanded));
+    card.tabIndex = 0;
     card.title = session.label + (session.project ? ' · ' + session.project : '');
 
     var accent = document.createElement('span');
@@ -2130,14 +2499,40 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     accent.style.background = session.color || 'var(--accent)';
     card.appendChild(accent);
 
+    var caret = document.createElement('button');
+    caret.type = 'button';
+    caret.className = 'rail-caret';
+    caret.textContent = expanded ? '▾' : '▸';
+    caret.title = expanded ? '收起回复' : '展开回复';
+    caret.setAttribute('aria-label', (expanded ? '收起 ' : '展开 ') + (session.label || session.id));
+    caret.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      app.expandedSessions[session.id] = !isSessionExpanded(session.id);
+      saveRailState();
+      if (!app.replies[session.id]) {
+        loadSessionReplies(session.id, false).then(function () { renderRail(); });
+      }
+      renderRail();
+    });
+    card.appendChild(caret);
+
     var main = document.createElement('div');
     main.className = 'rail-main';
     var top = document.createElement('div');
     top.className = 'rail-top';
     var label = document.createElement('span');
     label.className = 'rail-label';
-    label.textContent = session.label || session.id;
+    label.textContent = inPinned
+      ? (session.label || session.id)
+      : RailTreeCore.stripProjectPrefix(session);
     top.appendChild(label);
+    if (inPinned && session.project) {
+      var pill = document.createElement('span');
+      pill.className = 'rail-project-pill';
+      pill.textContent = session.project;
+      pill.title = session.project;
+      top.appendChild(pill);
+    }
     if (session.client) {
       var client = document.createElement('span');
       client.className = 'rail-client';
@@ -2179,8 +2574,39 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }));
     card.appendChild(actions);
 
-    card.addEventListener('click', function () { focusSession(session.id); });
-    return card;
+    function openSession(ev) {
+      if (ev) ev.stopPropagation();
+      focusSession(session.id);
+    }
+    card.addEventListener('click', openSession);
+    card.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        openSession(ev);
+      }
+    });
+    node.appendChild(card);
+
+    if (expanded) node.appendChild(sessionReplies(session));
+    return node;
+  }
+
+  function railGroup(group, pinned) {
+    var wrap = document.createElement('section');
+    wrap.className = 'rail-group' + (pinned ? ' rail-group-pinned' : '');
+    wrap.dataset.groupKey = group.key;
+    wrap.appendChild(railGroupHead(group, pinned));
+
+    if (!app.collapsedGroups[group.key]) {
+      var body = document.createElement('div');
+      body.className = 'rail-group-body';
+      body.setAttribute('role', 'group');
+      group.sessions.forEach(function (session) {
+        body.appendChild(sessionTreeNode(session, { inPinned: pinned }));
+      });
+      wrap.appendChild(body);
+    }
+    return wrap;
   }
 
   function renderRail() {
@@ -2196,15 +2622,17 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     if (isFeed) { renderFeed(); return; }
 
     list.innerHTML = '';
-    var rows = app.sessions.slice();
-    if (app.filter === 'unread') rows = rows.filter(function (s) { return unreadCount(s) > 0; });
-    else if (app.filter === 'pinned') rows = rows.filter(function (s) { return !!s.pinned; });
+    var tree = RailTreeCore.buildRailTree(app.sessions, {
+      filter: app.filter,
+      unreadCountOf: unreadCount
+    });
 
-    if (!rows.length) {
+    if (!tree.totalCount) {
       list.appendChild(railEmpty(app.sessions.length ? '没有符合筛选条件的会话' : '还没有会话。让 Agent 发布一条回复即可。'));
       return;
     }
-    rows.forEach(function (s) { list.appendChild(sessionCard(s)); });
+    if (tree.pinned) list.appendChild(railGroup(tree.pinned, true));
+    tree.projects.forEach(function (group) { list.appendChild(railGroup(group, false)); });
   }
 
   function renderFeed() {
@@ -2279,6 +2707,16 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       if (seq > app.globalSeq) app.globalSeq = seq;
       app.latestSessionId = data.latest_session_id || app.latestSessionId;
       app.latestReplyId = data.latest_reply_id || app.latestReplyId;
+      app.sessions.forEach(function (s) {
+        if (!isSessionExpanded(s.id)) return;
+        var rows = app.replies[s.id];
+        var stale = !rows ||
+          (s.reply_count && rows.length < s.reply_count) ||
+          (s.seq && (!rows[0] || Number(rows[0].seq || 0) < Number(s.seq)));
+        if (stale) {
+          loadSessionReplies(s.id, true).then(function () { renderRail(); });
+        }
+      });
       renderRail();
       renderSplitSelect();
       return data;
@@ -2288,12 +2726,19 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   function loadSessionReplies(sessionId, force) {
     if (!sessionId) return Promise.resolve([]);
     if (app.replies[sessionId] && !force) return Promise.resolve(app.replies[sessionId]);
-    return fetchJSON('/api/sessions/' + encodeURIComponent(sessionId) + '/replies?limit=200')
+    if (app.loadingReplies[sessionId]) return app.loadingReplies[sessionId];
+    var job = fetchJSON('/api/sessions/' + encodeURIComponent(sessionId) + '/replies?limit=200')
       .then(function (data) {
         app.replies[sessionId] = Array.isArray(data.replies) ? data.replies : [];
         return app.replies[sessionId];
       })
-      .catch(function () { return app.replies[sessionId] || []; });
+      .catch(function () { return app.replies[sessionId] || []; })
+      .then(function (rows) {
+        delete app.loadingReplies[sessionId];
+        return rows;
+      });
+    app.loadingReplies[sessionId] = job;
+    return job;
   }
 
   function loadReply(pane, sessionId, replyId, opts) {
@@ -2483,6 +2928,14 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     pane.viewingHistory = false;
     app.pendingBanner = null;
     $('#new-reply-banner').hidden = true;
+    var target = null;
+    for (var i = 0; i < app.sessions.length; i++) {
+      if (app.sessions[i].id === sessionId) { target = app.sessions[i]; break; }
+    }
+    app.expandedSessions[sessionId] = true;
+    if (target) delete app.collapsedGroups[railGroupKey(target)];
+    saveRailState();
+    renderRail();
     if (!opts.silent) writeUrl({ session: sessionId, reply: opts.reply || null, mode: 'lock' });
     return loadSessionReplies(sessionId, true).then(function (rows) {
       renderRail();
@@ -2679,6 +3132,11 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     if (!sessionId) {
       refreshLatestNow();
       return;
+    }
+
+    /* Level 3 实时刷新：焦点会话与所有展开会话都要立刻看到新的 #N（阅读守卫下也不例外）。 */
+    if (sessionId === primary.sessionId || isSessionExpanded(sessionId)) {
+      loadSessionReplies(sessionId, true).then(function () { renderRail(); });
     }
 
     if (sessionId === primary.sessionId) {
@@ -2949,7 +3407,7 @@ class SSEBroker:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "VisualReply/4.0"
+    server_version = "VisualReply/5.0"
     protocol_version = "HTTP/1.1"
 
     cache_dir: Path = DEFAULT_CACHE_DIR

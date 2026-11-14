@@ -94,9 +94,7 @@ Every publish is attributed to a session, derived with zero configuration:
 `TMUX_PANE`, `WEZTERM_PANE`, `KITTY_WINDOW_ID`, `ITERM_SESSION_ID`) → a hash of the parent
 process and project root. Same shell stays in one lane; a different terminal gets its own.
 
-- **Session rail** — collapsible left rail sorted by pin, then recency, with a colour
-  accent, client badge, latest title, timestamp and unread count. Filter by
-  *all / unread / pinned*, or open the **global timeline** across every session.
+- **3-level sidebar tree** — collapsible left rail organized as a dedicated **Pinned (`★ 置顶`)** section at the top, followed by **Project → Session → Reply** folders. Projects and sessions stay anchored in fixed creation order (newest at top, never jumping when background agents reply), and expanding any session lists its rounds newest-first (`#N (latest)` at top). Filter by *all / unread / pinned*, or open the **global timeline** across every session.
 - **Focus lock** — the default once a session is focused (via a deep link or a click in
   the rail). A reply from another session never hijacks the pane you are reading; it
   marks that lane unread and shows a clickable toast instead. Switch to *follow global*

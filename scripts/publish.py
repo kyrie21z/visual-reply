@@ -51,7 +51,7 @@ DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
 SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
-VERSION = 4
+VERSION = 5
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 
 # 长度提醒阈值：只警告，不阻塞发布
