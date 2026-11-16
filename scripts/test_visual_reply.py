@@ -302,6 +302,146 @@ CANVAS = {
 
 CANVAS_TEXT = json.dumps(CANVAS, ensure_ascii=False, indent=2)
 
+#: v6 科研画布：表格 + 四类图表 + 长文，全部使用通用基准命名。
+SCIENTIFIC_CANVAS = {
+    "headline": "统一基准：表格、四类图表与结论文本同屏",
+    "badges": [
+        {"text": "可复现实测", "tone": "ok"},
+        {"text": "离线渲染", "tone": "accent"},
+    ],
+    "sections": [
+        {
+            "type": "table",
+            "title": "主结果（三次运行均值）",
+            "span": 1,
+            "caption": "Table 1 · 主基准，列内标注越高越好 / 越低越好",
+            "note": "点击表头排序，行内按钮切换基准；LaTeX / Markdown / CSV 一键导出。",
+            "groups": [
+                {"label": "Quality", "cols": ["acc", "f1"]},
+                {"label": "Cost", "cols": ["lat", "mem"]},
+            ],
+            "baseline_id": "base",
+            "columns": [
+                {"key": "model", "label": "Model"},
+                {"key": "params", "label": "Params", "unit": "M", "decimals": 1},
+                {"key": "acc", "label": "Acc", "unit": "%", "higher_is_better": True, "decimals": 1},
+                {"key": "f1", "label": "F1", "unit": "%", "higher_is_better": True, "decimals": 1},
+                {"key": "lat", "label": "Latency", "unit": "ms", "higher_is_better": False,
+                 "decimals": 1},
+                {"key": "mem", "label": "Memory", "unit": "GB", "higher_is_better": False,
+                 "decimals": 2},
+            ],
+            "rows": [
+                {"id": "base", "model": "Baseline", "params": 24.0, "acc": 70.2, "f1": 68.4,
+                 "lat": 92.5, "mem": 5.6, "is_baseline": True,
+                 "details": "## Baseline\n\n固定随机种子与数据切分。"},
+                {"id": "small", "model": "Small", "params": 12.5, "acc": 68.1, "f1": 66.2,
+                 "lat": 61.4, "mem": 2.8},
+                {"id": "wide", "model": "Wide", "params": 48.0, "acc": 75.3, "f1": 73.9,
+                 "lat": 140.2, "mem": 11.4,
+                 "details": "## Wide\n\n参数量翻倍，延迟明显上升。"},
+                {"id": "ours", "model": "Ours", "params": 26.5, "acc": 77.6, "f1": 76.1,
+                 "lat": 95.1, "mem": 5.9, "emphasis": True,
+                 "cells": {"acc": {"value": 77.6, "note": "三次运行均值"},
+                           "f1": {"value": 76.1, "display": "76.1", "note": "标准差 0.2"}},
+                 "summary": "精度最高，延迟与基准基本持平。"},
+            ],
+        },
+        {
+            "type": "chart",
+            "title": "分组柱状：质量与成本",
+            "span": 1,
+            "chart_type": "bar",
+            "categories": ["Acc", "F1", "Throughput"],
+            "series": [
+                {"name": "Baseline", "data": [70.2, 68.4, 62.0], "summary": "基准实现"},
+                {"name": "Ours", "data": [77.6, 76.1, 74.5],
+                 "details": "## Ours\n\n统一训练配置。"},
+            ],
+            "unit": "%",
+            "y_label": "Score",
+            "ref_lines": [{"value": 75, "label": "target", "tone": "warn"}],
+            "note": "参考线为验收阈值。",
+        },
+        {
+            "type": "chart",
+            "title": "训练曲线",
+            "chart_type": "line",
+            "x": ["1", "2", "3", "4", "5"],
+            "series": [
+                {"name": "Baseline", "data": [52.0, 61.4, 66.8, 69.1, 70.2]},
+                {"name": "Ours", "data": [55.1, 65.2, 71.4, 75.0, 77.6]},
+                {"name": "Ablation", "data": [50.2, 58.1, None, 66.4, 68.0], "dashed": True},
+            ],
+            "unit": "%",
+            "y_label": "Acc",
+            "ref_lines": [{"value": 75, "label": "target"}],
+        },
+        {
+            "type": "chart",
+            "title": "精度-延迟前沿",
+            "span": 1,
+            "chart_type": "scatter",
+            "x_label": "Latency (ms)",
+            "y_label": "Acc (%)",
+            "pareto": "max_y_min_x",
+            "points": [
+                {"label": "Base", "x": 92.5, "y": 70.2, "group": "baseline"},
+                {"label": "Small", "x": 61.4, "y": 68.1, "group": "candidate",
+                 "summary": "延迟最低"},
+                {"label": "Wide", "x": 140.2, "y": 75.3, "group": "candidate",
+                 "details": "## Wide\n\n参数翻倍。"},
+                {"label": "Ours", "x": 95.1, "y": 77.6, "group": "candidate", "highlight": True,
+                 "details": "## Ours\n\n精度最高。"},
+            ],
+            "note": "虚线为帕累托前沿：同等延迟下精度最高。",
+        },
+        {
+            "type": "chart",
+            "title": "消融矩阵",
+            "span": 1,
+            "chart_type": "heatmap",
+            "x_labels": ["w/o A", "w/o B", "full"],
+            "y_labels": ["Seed 1", "Seed 2", "Seed 3"],
+            "values": [[74.1, 75.2, 77.6], [73.8, 74.9, 77.2], [74.4, 75.6, 77.9]],
+            "scale_mode": "max_good",
+            "unit": "%",
+            "cell_details": [
+                [None, None, {"details": "## full\n\n完整配置。"}],
+                [None, None, None],
+                [None, None, None],
+            ],
+        },
+        {
+            "type": "prose",
+            "title": "结论",
+            "tone": "accent",
+            "content": "## 结论\n\n- **Ours** 在同量级延迟下取得最高精度。\n"
+                       "- 表格支持基准对比与三种导出格式。\n\n"
+                       "| 维度 | 结论 |\n| --- | --- |\n| Quality | Ours 最优 |\n"
+                       "| Cost | 与 Baseline 持平 |",
+        },
+    ],
+}
+SCIENTIFIC_TEXT = json.dumps(SCIENTIFIC_CANVAS, ensure_ascii=False)
+
+TABLE_COLUMNS = [
+    {"key": "model", "label": "Model"},
+    {"key": "acc", "label": "Acc (%)", "higher_is_better": True, "decimals": 1},
+    {"key": "lat", "label": "Lat_ms", "higher_is_better": False, "decimals": 1},
+    {"key": "gain", "label": "Gain", "decimals": 2},
+    {"key": "tag", "label": "Tag"},
+]
+
+TABLE_ROWS = [
+    {"id": "base", "model": "Baseline", "acc": 70.2, "lat": 92.5, "gain": 0.0,
+     "tag": "a_b & 100%", "is_baseline": True},
+    {"id": "m1", "model": "Model A", "acc": 74.6, "lat": 88.1, "tag": "seed 1|2",
+     "cells": {"gain": {"value": 4.4, "display": "+4.4", "note": "three runs"}}},
+    {"id": "m2", "model": "Model B", "acc": 76.1, "lat": 95.4, "gain": 5.9, "tag": "mean"},
+    {"id": "m3", "model": "Model C", "acc": 76.1, "lat": None, "gain": None, "tag": "n/a"},
+]
+
 NODES_ONLY = {
     "headline": "仅 nodes 的最小拓扑",
     "nodes": [
@@ -517,6 +657,187 @@ def run_rail_core(page: str, payload: dict, workdir: Path) -> dict:
     core_path.write_text(core, encoding="utf-8")
     data_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     driver_path.write_text(RAIL_DRIVER, encoding="utf-8")
+
+    try:
+        proc = subprocess.run(
+            [node, str(driver_path), str(core_path), str(data_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"node 执行异常: {exc}"}
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    try:
+        return json.loads(out)
+    except ValueError:
+        err = proc.stderr.decode("utf-8", errors="replace")[:300]
+        return {"ok": False, "error": f"node 输出无法解析: {out[:200]} {err}"}
+
+
+TABLE_DRIVER = r"""
+const vm = require('vm');
+const fs = require('fs');
+
+const core = fs.readFileSync(process.argv[2], 'utf8');
+const data = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const sandbox = { console: console };
+vm.createContext(sandbox);
+try {
+  vm.runInContext(core, sandbox, { timeout: 5000 });
+} catch (err) {
+  console.log(JSON.stringify({ ok: false, error: '表格核心执行失败: ' + err.message }));
+  process.exit(0);
+}
+const api = sandbox.TableCore;
+if (!api || typeof api.toLatex !== 'function') {
+  console.log(JSON.stringify({ ok: false, error: '未导出 TableCore.toLatex' }));
+  process.exit(0);
+}
+const out = {};
+try {
+  if (data.op === 'rank') out.ranks = api.rankColumns(data.columns, data.rows);
+  else if (data.op === 'highlight') {
+    out.values = (data.columns || []).map(function (c) { return api.effectiveHighlight(c); });
+  } else if (data.op === 'delta') {
+    out.values = (data.cases || []).map(function (c) {
+      return api.computeDelta(c.num, c.base, c.col, c.decimals);
+    });
+  } else if (data.op === 'sort') {
+    out.rows = api.sortRows(data.rows, data.colKey, data.dir, data.pinnedTopIds || [])
+      .map(function (r) { return r.id; });
+  } else if (data.op === 'filter') {
+    out.rows = api.filterRows(data.rows, data.columns, data.query)
+      .map(function (r) { return r.id; });
+  } else if (data.op === 'latex') {
+    out.value = api.toLatex(data.columns, data.rows, data.groups, data.opts || {});
+  } else if (data.op === 'markdown') {
+    out.value = api.toMarkdown(data.columns, data.rows, {});
+  } else if (data.op === 'csv') {
+    out.value = api.toCsv(data.columns, data.rows);
+  } else if (data.op === 'escape') {
+    out.values = (data.values || []).map(function (v) { return api.escapeLatex(v); });
+  } else if (data.op === 'resolve') {
+    out.values = (data.cases || []).map(function (c) {
+      return api.resolveBaselineId(c.rows, c.explicitId);
+    });
+  } else if (data.op === 'decimals') {
+    out.values = (data.cases || []).map(function (c) { return api.inferDecimals(c.col, c.values); });
+  } else if (data.op === 'cell') {
+    out.values = (data.rows || []).map(function (r) { return api.getCell(r, data.key); });
+  } else {
+    out.error = 'unknown op';
+  }
+} catch (err) {
+  console.log(JSON.stringify({ ok: false, error: 'TableCore 执行失败: ' + err.message }));
+  process.exit(0);
+}
+console.log(JSON.stringify({ ok: true, result: out }));
+"""
+
+
+def run_table_core(page: str, payload: dict, workdir: Path) -> dict:
+    """抽出 PAGE_HTML 里的纯表格核心，在本机 node 的 vm 沙箱里实跑。"""
+    node = shutil.which("node")
+    if not node:
+        return {"ok": False, "error": "node 未安装，无法跑表格断言"}
+    start = "/* ==== VR_TABLE_CORE_START ==== */"
+    end = "/* ==== VR_TABLE_CORE_END ==== */"
+    if start not in page or end not in page:
+        return {"ok": False, "error": "PAGE_HTML 缺少表格核心标记"}
+    core = page.split(start, 1)[1].split(end, 1)[0]
+
+    core_path = workdir / "table_core.js"
+    data_path = workdir / "table_payload.json"
+    driver_path = workdir / "table_driver.js"
+    core_path.write_text(core, encoding="utf-8")
+    data_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    driver_path.write_text(TABLE_DRIVER, encoding="utf-8")
+
+    try:
+        proc = subprocess.run(
+            [node, str(driver_path), str(core_path), str(data_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"node 执行异常: {exc}"}
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    try:
+        return json.loads(out)
+    except ValueError:
+        err = proc.stderr.decode("utf-8", errors="replace")[:300]
+        return {"ok": False, "error": f"node 输出无法解析: {out[:200]} {err}"}
+
+
+CHART_DRIVER = r"""
+const vm = require('vm');
+const fs = require('fs');
+
+const core = fs.readFileSync(process.argv[2], 'utf8');
+const data = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const sandbox = { console: console };
+vm.createContext(sandbox);
+try {
+  vm.runInContext(core, sandbox, { timeout: 5000 });
+} catch (err) {
+  console.log(JSON.stringify({ ok: false, error: '图表核心执行失败: ' + err.message }));
+  process.exit(0);
+}
+const api = sandbox.ChartCore;
+if (!api || typeof api.layoutChart !== 'function') {
+  console.log(JSON.stringify({ ok: false, error: '未导出 ChartCore.layoutChart' }));
+  process.exit(0);
+}
+function collect(value, path, bad) {
+  if (value === null || value === undefined) return;
+  if (typeof value === 'number') {
+    if (!isFinite(value)) bad.push(path + '=' + value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach(function (item, index) { collect(item, path + '[' + index + ']', bad); });
+    return;
+  }
+  if (typeof value === 'object') {
+    Object.keys(value).forEach(function (key) { collect(value[key], path + '.' + key, bad); });
+  }
+}
+const out = {};
+try {
+  if (data.op === 'scale') {
+    out.scale = api.niceScale(data.min, data.max, data.ticks, !!data.includeZero);
+    out.bad = [];
+    collect(out.scale, 'scale', out.bad);
+  } else if (data.op === 'kind') {
+    out.kind = api.chartKind(data.spec || {});
+  } else {
+    out.layout = api.layoutChart(data.spec || {});
+    out.bad = [];
+    collect(out.layout, 'layout', out.bad);
+  }
+} catch (err) {
+  console.log(JSON.stringify({ ok: false, error: 'ChartCore 执行失败: ' + err.message }));
+  process.exit(0);
+}
+console.log(JSON.stringify({ ok: true, result: out }));
+"""
+
+
+def run_chart_core(page: str, payload: dict, workdir: Path) -> dict:
+    """抽出 PAGE_HTML 里的纯图表核心，在本机 node 的 vm 沙箱里实跑。"""
+    node = shutil.which("node")
+    if not node:
+        return {"ok": False, "error": "node 未安装，无法跑图表断言"}
+    start = "/* ==== VR_CHART_CORE_START ==== */"
+    end = "/* ==== VR_CHART_CORE_END ==== */"
+    if start not in page or end not in page:
+        return {"ok": False, "error": "PAGE_HTML 缺少图表核心标记"}
+    core = page.split(start, 1)[1].split(end, 1)[0]
+
+    core_path = workdir / "chart_core.js"
+    data_path = workdir / "chart_payload.json"
+    driver_path = workdir / "chart_driver.js"
+    core_path.write_text(core, encoding="utf-8")
+    data_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    driver_path.write_text(CHART_DRIVER, encoding="utf-8")
 
     try:
         proc = subprocess.run(
@@ -1929,6 +2250,289 @@ def main() -> int:
               and [s.get("id") for s in (pinned_tree.get("pinned") or {}).get("sessions", [])]
               == ["pin-two", "pin-one"], str(pinned_tree))
 
+        print("\n[16c] 表格核心（Node VM）")
+        rank_result = run_table_core(
+            page, {"op": "rank", "columns": TABLE_COLUMNS, "rows": TABLE_ROWS}, geo_dir)
+        ranks = (rank_result.get("result") or {}).get("ranks") or {}
+        check("表格核心可在 node vm 中执行", bool(ranks), str(rank_result.get("error")))
+        if ranks:
+            check("rankColumns 并列最优共享 best，次优取下一档",
+                  ranks.get("acc", {}).get("best") == 76.1
+                  and ranks.get("acc", {}).get("second") == 74.6,
+                  str(ranks.get("acc")))
+            check("rankColumns 对越低越好的列取最小值",
+                  ranks.get("lat", {}).get("best") == 88.1
+                  and ranks.get("lat", {}).get("second") == 92.5,
+                  str(ranks.get("lat")))
+            check("rankColumns 未声明方向时不排名",
+                  ranks.get("gain") == {"best": None, "second": None}, str(ranks.get("gain")))
+
+        highlight_result = run_table_core(page, {"op": "highlight", "columns": [
+            {"key": "a", "higher_is_better": True},
+            {"key": "b", "higher_is_better": False},
+            {"key": "c", "highlight": "max", "higher_is_better": False},
+            {"key": "d", "highlight": "none", "higher_is_better": True},
+            {"key": "e"},
+        ]}, geo_dir)
+        check("effectiveHighlight 支持 max / min / none",
+              (highlight_result.get("result") or {}).get("values")
+              == ["max", "min", "max", "none", "none"], str(highlight_result))
+
+        delta_result = run_table_core(page, {"op": "delta", "cases": [
+            {"num": 76.1, "base": 70.2, "col": {"higher_is_better": True}, "decimals": 1},
+            {"num": 88.1, "base": 92.5, "col": {"higher_is_better": False}, "decimals": 1},
+            {"num": 95.4, "base": 92.5, "col": {"higher_is_better": False}, "decimals": 1},
+            {"num": 70.2, "base": 70.2, "col": {"higher_is_better": True}, "decimals": 1},
+            {"num": 42, "base": 40,
+             "col": {"higher_is_better": True, "delta_unit": "%"}, "decimals": 0},
+        ]}, geo_dir)
+        deltas = (delta_result.get("result") or {}).get("values") or []
+        check("computeDelta 输出数值、符号与方向",
+              len(deltas) == 5
+              and abs(deltas[0].get("diff", 0) - 5.9) < 1e-9
+              and deltas[0].get("text") == "+5.9" and deltas[0].get("tone") == "pos"
+              and deltas[1].get("text") == "-4.4" and deltas[1].get("tone") == "pos"
+              and deltas[2].get("text") == "+2.9" and deltas[2].get("tone") == "neg"
+              and deltas[3].get("tone") == "zero"
+              and deltas[4].get("text") == "+2%", str(deltas))
+
+        sort_desc = run_table_core(
+            page, {"op": "sort", "rows": TABLE_ROWS, "colKey": "acc", "dir": "desc"}, geo_dir)
+        check("sortRows 数值降序且并列保持原序",
+              (sort_desc.get("result") or {}).get("rows") == ["m2", "m3", "m1", "base"],
+              str(sort_desc))
+        sort_asc = run_table_core(
+            page, {"op": "sort", "rows": TABLE_ROWS, "colKey": "acc", "dir": "asc"}, geo_dir)
+        check("sortRows 数值升序",
+              (sort_asc.get("result") or {}).get("rows") == ["base", "m1", "m2", "m3"],
+              str(sort_asc))
+        null_asc = run_table_core(
+            page, {"op": "sort", "rows": TABLE_ROWS, "colKey": "lat", "dir": "asc"}, geo_dir)
+        null_desc = run_table_core(
+            page, {"op": "sort", "rows": TABLE_ROWS, "colKey": "lat", "dir": "desc"}, geo_dir)
+        check("sortRows 缺失值无论升降序都沉底",
+              (null_asc.get("result") or {}).get("rows") == ["m1", "base", "m2", "m3"]
+              and (null_desc.get("result") or {}).get("rows") == ["m2", "base", "m1", "m3"],
+              f"{null_asc} / {null_desc}")
+        pinned = run_table_core(page, {
+            "op": "sort", "rows": TABLE_ROWS, "colKey": "acc", "dir": "desc",
+            "pinnedTopIds": ["m1"]}, geo_dir)
+        check("sortRows 支持置顶基准行",
+              (pinned.get("result") or {}).get("rows") == ["m1", "m2", "m3", "base"],
+              str(pinned))
+
+        filter_upper = run_table_core(page, {
+            "op": "filter", "rows": TABLE_ROWS, "columns": TABLE_COLUMNS, "query": "MODEL b"}, geo_dir)
+        filter_cell = run_table_core(page, {
+            "op": "filter", "rows": TABLE_ROWS, "columns": TABLE_COLUMNS, "query": "seed"}, geo_dir)
+        filter_blank = run_table_core(page, {
+            "op": "filter", "rows": TABLE_ROWS, "columns": TABLE_COLUMNS, "query": "N/A"}, geo_dir)
+        check("filterRows 大小写不敏感并覆盖所有可见单元格",
+              (filter_upper.get("result") or {}).get("rows") == ["m2"]
+              and (filter_cell.get("result") or {}).get("rows") == ["m1"]
+              and (filter_blank.get("result") or {}).get("rows") == ["m3"],
+              f"{filter_upper} / {filter_cell} / {filter_blank}")
+
+        latex_result = run_table_core(page, {
+            "op": "latex", "columns": TABLE_COLUMNS, "rows": TABLE_ROWS,
+            "groups": [{"label": "Quality", "cols": ["acc", "lat"]},
+                       {"label": "Gain", "cols": ["gain"]}]}, geo_dir)
+        latex_text = (latex_result.get("result") or {}).get("value") or ""
+        check("toLatex 输出 booktabs 表格与分组表头",
+              "\\begin{tabular}{lrrrl}" in latex_text
+              and "\\toprule" in latex_text and "\\bottomrule" in latex_text
+              and "\\multicolumn{2}{c}{Quality}" in latex_text
+              and "\\cmidrule(lr){2-3}" in latex_text
+              and "\\midrule" in latex_text, latex_text[:400])
+        check("toLatex 最佳加粗、次优下划线",
+              "\\textbf{76.1}" in latex_text and "\\underline{74.6}" in latex_text,
+              latex_text)
+        check("toLatex 转义 % _ & 且不破坏命令反斜杠",
+              "Acc (\\%)" in latex_text and "Lat\\_ms" in latex_text
+              and "a\\_b \\& 100\\%" in latex_text
+              and "\\\\toprule" not in latex_text and "\\\\textbf" not in latex_text,
+              latex_text)
+
+        markdown_result = run_table_core(page, {
+            "op": "markdown", "columns": TABLE_COLUMNS, "rows": TABLE_ROWS}, geo_dir)
+        markdown_text = (markdown_result.get("result") or {}).get("value") or ""
+        check("toMarkdown 输出对齐表头与最佳/次优标记",
+              "| Model | Acc (%) |" in markdown_text
+              and "| :--- | ---: | ---: |" in markdown_text
+              and "**76.1**" in markdown_text and "__74.6__" in markdown_text,
+              markdown_text[:300])
+        check("toMarkdown 转义竖线",
+              "seed 1\\|2" in markdown_text, markdown_text[:300])
+
+        csv_result = run_table_core(page, {
+            "op": "csv",
+            "columns": [{"key": "a", "label": "A"}, {"key": "b", "label": "B"}],
+            "rows": [{"id": "r0", "a": "x,y", "b": "he said \"hi\"\nnext"}]}, geo_dir)
+        csv_text = (csv_result.get("result") or {}).get("value") or ""
+        check("toCsv 按 RFC 4180 转义逗号、引号与换行",
+              '"x,y"' in csv_text and '"he said ""hi""\nnext"' in csv_text,
+              repr(csv_text))
+
+        resolve_result = run_table_core(page, {"op": "resolve", "cases": [
+            {"rows": TABLE_ROWS, "explicitId": "m2"},
+            {"rows": TABLE_ROWS, "explicitId": "missing"},
+            {"rows": [{"id": "x", "acc": 1}, {"id": "y", "acc": 2}], "explicitId": ""},
+        ]}, geo_dir)
+        check("resolveBaselineId 显式优先并回退 is_baseline",
+              (resolve_result.get("result") or {}).get("values") == ["m2", "base", ""],
+              str(resolve_result))
+
+        decimals_result = run_table_core(page, {"op": "decimals", "cases": [
+            {"col": {"decimals": 3}, "values": [1, 2]},
+            {"col": {"decimals": 9}, "values": [1.5]},
+            {"col": {}, "values": [1, 2]},
+            {"col": {}, "values": [1.25, 2]},
+        ]}, geo_dir)
+        check("inferDecimals 尊重显式值并夹到 0..4",
+              (decimals_result.get("result") or {}).get("values") == [3, 4, 0, 1],
+              str(decimals_result))
+
+        cell_result = run_table_core(page, {
+            "op": "cell", "rows": [TABLE_ROWS[1]], "key": "gain"}, geo_dir)
+        cell = ((cell_result.get("result") or {}).get("values") or [{}])[0]
+        check("getCell 解析对象单元格的 value / display / note",
+              cell.get("num") == 4.4 and cell.get("text") == "+4.4"
+              and cell.get("note") == "three runs" and cell.get("hasDisplay") is True,
+              str(cell))
+
+        escape_result = run_table_core(page, {"op": "escape", "values": [
+            "100% & a_b", "C:\\tmp", "x~y^z#1$2"]}, geo_dir)
+        escaped = (escape_result.get("result") or {}).get("values") or []
+        check("escapeLatex 覆盖反斜杠与 LaTeX 特殊字符",
+              escaped[0] == "100\\% \\& a\\_b"
+              and "\\textbackslash{}tmp" in escaped[1]
+              and "\\textasciitilde{}" in escaped[2]
+              and "\\textasciicircum{}" in escaped[2]
+              and "\\#" in escaped[2] and "\\$" in escaped[2],
+              str(escaped))
+
+        print("\n[16d] 图表核心（Node VM）")
+        scale_case = run_chart_core(page, {
+            "op": "scale", "min": 0, "max": 100, "ticks": 5, "includeZero": True}, geo_dir)
+        scale_data = (scale_case.get("result") or {}).get("scale") or {}
+        check("niceScale 常规区间返回干净刻度",
+              bool(scale_data) and scale_data.get("min") <= 0 and scale_data.get("max") >= 100
+              and len(scale_data.get("ticks", [])) >= 3
+              and (scale_case.get("result") or {}).get("bad") == [],
+              str(scale_case))
+        negative = run_chart_core(page, {"op": "scale", "min": -42.5, "max": -3.5, "ticks": 5}, geo_dir)
+        check("niceScale 负区间不产生 NaN / Infinity",
+              (negative.get("result") or {}).get("bad") == []
+              and (negative.get("result") or {}).get("scale", {}).get("max", 0) > -3.5, str(negative))
+        constant = run_chart_core(page, {"op": "scale", "min": 50, "max": 50, "ticks": 5}, geo_dir)
+        constant_scale = (constant.get("result") or {}).get("scale") or {}
+        check("niceScale 常量输入仍满足 max > min",
+              constant_scale.get("max", 0) > constant_scale.get("min", 0)
+              and len(constant_scale.get("ticks", [])) >= 2
+              and (constant.get("result") or {}).get("bad") == [], str(constant))
+        empty_scale = run_chart_core(page, {"op": "scale", "ticks": 5}, geo_dir)
+        empty_data = (empty_scale.get("result") or {}).get("scale") or {}
+        check("niceScale 空输入也返回有限区间",
+              empty_data.get("max", 0) > empty_data.get("min", 0)
+              and (empty_scale.get("result") or {}).get("bad") == [], str(empty_scale))
+
+        bar_case = run_chart_core(page, {"op": "bar", "spec": {
+            "categories": ["A", "B", "C"],
+            "series": [{"name": "M1", "data": [10, 20, None]},
+                       {"name": "M2", "data": [8, 15, 22]}],
+            "unit": "%", "ref_lines": [{"value": 18, "label": "target"}]}}, geo_dir)
+        bar_layout = (bar_case.get("result") or {}).get("layout") or {}
+        bar_bounds = all(
+            0 <= b.get("x", -1) and b.get("x", 0) + b.get("w", 0) <= bar_layout.get("width", 0)
+            and 0 <= b.get("y", -1) and b.get("y", 0) + b.get("h", 0) <= bar_layout.get("height", 0)
+            for b in bar_layout.get("bars", []))
+        check("bar 布局生成柱体、图例与参考线",
+              len(bar_layout.get("bars", [])) == 5
+              and len(bar_layout.get("legend", [])) == 2
+              and len(bar_layout.get("refLines", [])) == 1, str(bar_layout)[:300])
+        check("bar 所有坐标落在 viewBox 内且无 NaN",
+              bar_bounds and (bar_case.get("result") or {}).get("bad") == [],
+              f"{bar_bounds} / {(bar_case.get('result') or {}).get('bad')}")
+
+        line_case = run_chart_core(page, {"op": "line", "spec": {
+            "x": ["a", "b", "c", "d"],
+            "series": [{"name": "S1", "data": [1, None, 3, 4]},
+                       {"name": "S2", "data": [2, 3, 4, 5]}],
+            "hiddenSeries": {"S2": True}}}, geo_dir)
+        line_layout = (line_case.get("result") or {}).get("layout") or {}
+        check("line 在 null 处拆分路径段",
+              len(line_layout.get("lines", [])) == 1
+              and len((line_layout.get("lines") or [{}])[0].get("segments", [])) == 2
+              and ((line_layout.get("lines") or [{}])[0].get("d") or "").count("M") == 2,
+              str(line_layout)[:300])
+        check("line hiddenSeries 关闭图例系列",
+              len(line_layout.get("points", [])) == 3
+              and (line_case.get("result") or {}).get("bad") == [], str(line_layout)[:300])
+
+        scatter_case = run_chart_core(page, {"op": "scatter", "spec": {
+            "x_label": "Latency", "y_label": "Acc", "pareto": "max_y_min_x",
+            "points": [{"label": "A", "x": 1, "y": 10}, {"label": "B", "x": 2, "y": 12},
+                       {"label": "C", "x": 3, "y": 11}, {"label": "D", "x": 4, "y": 14}]}}, geo_dir)
+        scatter_layout = (scatter_case.get("result") or {}).get("layout") or {}
+        frontier = [p.get("label") for p in scatter_layout.get("frontier", [])]
+        check("scatter 帕累托前沿按 max_y_min_x 计算",
+              frontier == ["A", "B", "D"]
+              and str(scatter_layout.get("paretoPath", "")).startswith("M"), str(scatter_layout)[:300])
+        scatter_bounds = all(
+            0 <= p.get("x", -1) <= scatter_layout.get("width", 0)
+            and 0 <= p.get("y", -1) <= scatter_layout.get("height", 0)
+            and p.get("labelX") is not None and p.get("labelY") is not None
+            for p in scatter_layout.get("points", []))
+        check("scatter 点与标签坐标有限且不越界",
+              scatter_bounds and (scatter_case.get("result") or {}).get("bad") == [],
+              f"{scatter_bounds} / {(scatter_case.get('result') or {}).get('bad')}")
+
+        heatmap_case = run_chart_core(page, {"op": "heatmap", "spec": {
+            "x_labels": ["x1", "x2", "x3"], "y_labels": ["y1", "y2"],
+            "values": [[0.1, 0.5, 0.9], [0.2, None, 0.7]],
+            "scale_mode": "max_good", "unit": "%"}}, geo_dir)
+        heatmap_layout = (heatmap_case.get("result") or {}).get("layout") or {}
+        heat_cells = heatmap_layout.get("cells", [])
+        heat_norms = [c.get("norm") for c in heat_cells]
+        heat_alphas = [c.get("alpha") for c in heat_cells]
+        check("heatmap 生成 2×3 网格并归一化强度",
+              len(heat_cells) == 6
+              and all(0 <= n <= 1 for n in heat_norms)
+              and all(0 <= a <= 1 for a in heat_alphas)
+              and (heatmap_case.get("result") or {}).get("bad") == [],
+              f"{heat_norms} / {heat_alphas}")
+        heat_plot = heatmap_layout.get("plot") or {}
+        check("heatmap 单元格不越出绘图区",
+              all(heat_plot.get("x", 0) <= c.get("x", -1)
+                  and c.get("x", 0) + c.get("w", 0) <= heat_plot.get("x", 0) + heat_plot.get("w", 0)
+                  and heat_plot.get("y", 0) <= c.get("y", -1)
+                  and c.get("y", 0) + c.get("h", 0) <= heat_plot.get("y", 0) + heat_plot.get("h", 0)
+                  for c in heat_cells), str(heat_plot))
+
+        sparse_case = run_chart_core(page, {"op": "heatmap", "spec": {
+            "x_labels": ["a", "b"], "y_labels": ["r1"],
+            "cells": [{"row": 0, "col": 1, "value": 5, "details": "## cell"}]}}, geo_dir)
+        sparse_layout = (sparse_case.get("result") or {}).get("layout") or {}
+        check("heatmap 支持稀疏 cells 输入",
+              len(sparse_layout.get("cells", [])) == 2
+              and any(c.get("value") == 5 and c.get("col") == 1
+                      for c in sparse_layout.get("cells", [])),
+              str(sparse_layout)[:300])
+
+        kind_cases = [
+            ({"matrix": [[1]], "x_labels": ["a"]}, "heatmap"),
+            ({"points": [{"x": 1, "y": 2}]}, "scatter"),
+            ({"x": [1, 2], "series": [{"name": "s", "data": [1, 2]}]}, "line"),
+            ({"categories": ["a"], "series": [{"name": "s", "data": [1]}]}, "bar"),
+        ]
+        kind_values = []
+        for spec_case, _ in kind_cases:
+            result = run_chart_core(page, {"op": "kind", "spec": spec_case}, geo_dir)
+            kind_values.append((result.get("result") or {}).get("kind"))
+        check("chartKind 从简写字段推断类型",
+              kind_values == [expected for _, expected in kind_cases], str(kind_values))
+
+
         check("Markdown 渲染逻辑只有一份",
               page.count("function renderReading(") == 1, str(page.count("function renderReading(")))
         check("画布渲染逻辑只有一份",
@@ -2018,6 +2622,99 @@ def main() -> int:
               status == 200 and "fixed-newer" in non_pinned_ids and "fixed-older" in non_pinned_ids
               and non_pinned_ids.index("fixed-newer") < non_pinned_ids.index("fixed-older"),
               str(non_pinned_ids))
+
+        # ---------- 17b. v6 科研画布发布与端到端接口 ----------
+        print("\n[17b] v6 科研画布发布与端到端接口")
+        code, sci = publish(port, cache, SCIENTIFIC_TEXT, "科研画布端到端")
+        check("v6 科研画布发布成功", code == 0 and sci.get("ok") is True, str(sci)[:400])
+        check("publish 版本为 6", sci.get("version") == 6, str(sci.get("version")))
+        check("科研画布自动识别为 json", sci.get("format") == "json", str(sci.get("format")))
+
+        status, sci_latest = get_json(f"{base}/api/latest")
+        check("/api/latest 返回科研画布",
+              status == 200 and sci_latest.get("format") == "json", str(status))
+        parsed_sci = json.loads(sci_latest.get("content") or "{}")
+        sci_types = [sec.get("type") for sec in parsed_sci.get("sections", [])]
+        check("科研画布包含 table / bar / line / scatter / heatmap / prose",
+              sci_types == ["table", "chart", "chart", "chart", "chart", "prose"],
+              str(sci_types))
+        check("科研画布保留 span=1 双列布局标记",
+              any(sec.get("span") == 1 for sec in parsed_sci.get("sections", [])), str(sci_types))
+        sci_table = next(sec for sec in parsed_sci["sections"] if sec.get("type") == "table")
+        check("表格带 groups / baseline_id / is_baseline 语义",
+              bool(sci_table.get("groups")) and sci_table.get("baseline_id") == "base"
+              and any(row.get("is_baseline") for row in sci_table.get("rows", [])),
+              str(sci_table)[:300])
+        sci_kinds = [sec.get("chart_type") for sec in parsed_sci["sections"]
+                     if sec.get("type") == "chart"]
+        check("四种图表类型齐全",
+              sci_kinds == ["bar", "line", "scatter", "heatmap"], str(sci_kinds))
+
+        sid = urllib.parse.quote(sci.get("session_id", ""), safe="")
+        rid = urllib.parse.quote(sci.get("reply_id", ""), safe="")
+        status, sci_reply = get_json(f"{base}/api/sessions/{sid}/replies/{rid}")
+        check("会话回复接口返回完整科研画布",
+              status == 200 and sci_reply.get("content") == SCIENTIFIC_TEXT, str(status))
+
+        shorthand_table = {
+            "headline": "简写表格：columns + rows 直接放顶层",
+            "columns": [
+                {"key": "name", "label": "Name"},
+                {"key": "score", "label": "Score", "higher_is_better": True, "decimals": 1},
+            ],
+            "rows": [{"name": "alpha", "score": 1.5}, {"name": "beta", "score": 2.5}],
+        }
+        code, short_table = publish(
+            port, cache, json.dumps(shorthand_table, ensure_ascii=False), "简写表格")
+        check("顶层 columns+rows 自动识别为 json",
+              code == 0 and short_table.get("format") == "json", str(short_table)[:300])
+
+        shorthand_chart = {
+            "headline": "简写图表：chart_type 直接放顶层",
+            "chart_type": "bar",
+            "categories": ["a", "b"],
+            "series": [{"name": "s", "data": [1, 2]}],
+        }
+        code, short_chart = publish(
+            port, cache, json.dumps(shorthand_chart, ensure_ascii=False), "简写图表")
+        check("顶层 chart_type 自动识别为 json",
+              code == 0 and short_chart.get("format") == "json", str(short_chart)[:300])
+
+        shorthand_matrix = {
+            "headline": "简写热力：matrix + x_labels",
+            "matrix": [[1, 2], [3, 4]],
+            "x_labels": ["x1", "x2"],
+        }
+        code, short_matrix = publish(
+            port, cache, json.dumps(shorthand_matrix, ensure_ascii=False), "简写热力")
+        check("顶层 matrix + x_labels 自动识别为 json",
+              code == 0 and short_matrix.get("format") == "json", str(short_matrix)[:300])
+
+        prose_only = {"headline": "简写长文：prose 字段", "prose": "## 说明\n\n正文段落。"}
+        code, prose_payload = publish(
+            port, cache, json.dumps(prose_only, ensure_ascii=False), "简写长文", fmt="json")
+        check("强制 json 的 prose 简写发布成功",
+              code == 0 and prose_payload.get("format") == "json", str(prose_payload)[:300])
+
+        status, body, _ = http(f"{base}/")
+        sci_page = body.decode("utf-8", errors="replace")
+        for token in ("VR_TABLE_CORE_START", "VR_CHART_CORE_START", "TableCore", "ChartCore",
+                      "function renderTable", "function renderChart", "function renderProse",
+                      "function bindTables", "function bindCharts", "toLatex", "toMarkdown",
+                      "toCsv", "tbl-base-btn", "tbl-export-preview", "chart-tip", "chart-pill",
+                      "cv-sections", '.cv-section[data-span="1"]', "--vc-0", "prose-card",
+                      "navigator.clipboard", "data-tcol", "data-tact", "hiddenSeries"):
+            check(f"v6 页面包含 {token}", token in sci_page)
+        check("normalizeCanvas 支持 table / chart / prose 简写",
+              "Array.isArray(data.columns) && Array.isArray(data.rows)" in sci_page
+              and "Array.isArray(data.matrix)" in sci_page
+              and "typeof data.prose === 'string'" in sci_page)
+
+        sci_serialized = json.dumps(SCIENTIFIC_CANVAS, ensure_ascii=False) + SCIENTIFIC_TEXT
+        home_patterns = ("/" + "home/", "/" + "Users/", "C:" + "\\Users\\")
+        check("科研画布样例不含本机路径或邮箱",
+              not any(pattern in sci_serialized for pattern in home_patterns)
+              and "@" not in sci_serialized)
 
     finally:
         print("\n[18] 清理")

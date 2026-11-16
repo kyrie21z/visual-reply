@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""visual-reply 本地预览服务 v4（纯标准库，多会话工作台）。
+"""visual-reply 本地预览服务 v6（纯标准库，多会话工作台）。
 
 三种渲染模式：
     md     兼容模式：阅读 / 脑图 / 分屏
-    json   Visual Canvas 交互画布：kpis / graph / comparison / bento / steps
+    json   Visual Canvas 交互画布：kpis / graph / comparison / bento / steps /
+           table / chart / prose
     html   HTML Artifact 沙箱：iframe 渲染 + 源码查看
 
 接口：
@@ -48,7 +49,7 @@ import vr_store  # noqa: E402  - 保证按路径加载时也能 import
 DEFAULT_PORT = 18765
 DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
-VERSION = 5
+VERSION = 6
 HISTORY_LIMIT = 20
 REPLY_LIMIT = 200
 FEED_LIMIT = 50
@@ -88,6 +89,12 @@ PAGE_HTML = r"""<!DOCTYPE html>
   --warn: #d97706;
   --err: #dc2626;
   --info: #2f6feb;
+  --vc-0: #2f6feb;
+  --vc-1: #0891b2;
+  --vc-2: #16a34a;
+  --vc-3: #d97706;
+  --vc-4: #9333ea;
+  --vc-5: #dc2626;
 }
 html[data-theme="dark"] {
   color-scheme: dark;
@@ -108,6 +115,12 @@ html[data-theme="dark"] {
   --warn: #d29922;
   --err: #f85149;
   --info: #58a6ff;
+  --vc-0: #58a6ff;
+  --vc-1: #39c5cf;
+  --vc-2: #3fb950;
+  --vc-3: #d29922;
+  --vc-4: #bc8cff;
+  --vc-5: #f85149;
 }
 html, body { height: 100%; }
 body {
@@ -261,7 +274,10 @@ body.mode-html #canvas-pane { display: none !important; }
 .badge[data-tone="warn"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
 .badge[data-tone="err"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); background: color-mix(in srgb, var(--err) 10%, transparent); }
 .badge[data-tone="accent"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: var(--accent-soft); }
-.cv-section { margin-top: 30px; }
+.cv-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; margin-top: 30px; }
+.cv-section { grid-column: 1 / -1; min-width: 0; margin-top: 0; }
+.cv-section[data-span="1"] { grid-column: span 1; }
+#stage[data-split] .cv-section[data-span="1"] { grid-column: 1 / -1; }
 .cv-sec-title { font-size: 11.5px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; color: var(--fg-muted); margin-bottom: 12px; }
 .raw-json {
   margin: 0; padding: 18px 20px; overflow: auto; white-space: pre-wrap;
@@ -387,6 +403,128 @@ body.mode-html #canvas-pane { display: none !important; }
 .step-title { margin-top: 3px; font-size: 13px; font-weight: 620; line-height: 1.4; }
 .step-summary { margin-top: 4px; font-size: 11.5px; color: var(--fg-muted); line-height: 1.5; }
 .step[data-status="active"] .step-title { color: var(--accent); }
+
+/* ---------- 科研表格 / 图表 / 长文 ---------- */
+.tbl-card { border: 1px solid var(--border); border-radius: 16px; background: var(--bg-elev); overflow: hidden; }
+.tbl-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--bg-soft); }
+.tbl-caption { flex: 1 1 150px; min-width: 0; font-size: 12px; color: var(--fg-muted); }
+.tbl-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.tbl-search {
+  width: 138px; padding: 5px 9px; font-size: 12px; color: var(--fg);
+  background: var(--bg-elev); border: 1px solid var(--border-strong); border-radius: 8px;
+}
+.tbl-search:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.tbl-btn {
+  font-size: 11.5px; line-height: 1; padding: 5px 9px; border-radius: 7px;
+  background: var(--bg-elev); border: 1px solid var(--border-strong); color: var(--fg-muted);
+}
+.tbl-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.tbl-btn[aria-pressed="true"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
+.tbl-scroll { overflow: auto; max-height: 68vh; }
+.exp-tbl { width: 100%; border-collapse: collapse; font-size: 12.8px; font-variant-numeric: tabular-nums; }
+.exp-tbl thead th {
+  position: sticky; top: 0; z-index: 2; padding: 9px 11px; white-space: nowrap;
+  background: var(--table-head); border-bottom: 1px solid var(--border-strong);
+  font-weight: 650; font-size: 11.5px; color: var(--fg-muted); cursor: pointer; user-select: none;
+}
+.exp-tbl thead th.tbl-act-head { cursor: default; width: 72px; }
+.exp-tbl thead th:hover { color: var(--accent); }
+.exp-tbl thead th.sorted { color: var(--accent); }
+.exp-tbl thead th.tbl-group-th { text-align: center; cursor: default; background: var(--bg-soft); font-size: 10.5px; letter-spacing: .04em; }
+.exp-tbl thead tr.tbl-group-row th { position: static; }
+.tbl-unit { font-weight: 500; color: var(--fg-muted); font-size: 10.5px; }
+.tbl-sort { margin-left: 3px; font-size: 10px; opacity: .85; }
+.exp-tbl tbody td { position: relative; padding: 8px 11px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.exp-tbl tbody tr:last-child td { border-bottom: 0; }
+.exp-tbl tbody tr:nth-child(even) { background: var(--table-alt); }
+.exp-tbl tbody tr:hover { background: var(--accent-soft); }
+.exp-tbl tbody tr[data-drawer] { cursor: pointer; }
+.exp-tbl tbody tr.divider td { border-top: 1px solid var(--border-strong); }
+.exp-tbl tbody tr.emph td { background: color-mix(in srgb, var(--accent) 7%, transparent); font-weight: 600; }
+.exp-tbl tbody tr.is-base td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
+.tbl-act { width: 72px; white-space: nowrap; }
+.tbl-base-btn {
+  padding: 3px 7px; font-size: 10.5px; line-height: 1.2; border-radius: 6px;
+  color: var(--fg-muted); background: transparent; border: 1px solid var(--border-strong);
+  opacity: .32; transition: opacity .15s, color .15s, border-color .15s;
+}
+.exp-tbl tbody tr:hover .tbl-base-btn { opacity: 1; }
+.tbl-base-btn:hover { color: var(--warn); border-color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.tbl-base-tag { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 10.5px; font-weight: 600; color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent); }
+.tbl-best { font-weight: 700; color: var(--ok); }
+.tbl-second { font-weight: 600; text-decoration: underline; text-underline-offset: 2px; color: var(--fg); }
+.tbl-delta { display: block; margin-top: 2px; font-size: 10.5px; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.tbl-delta[data-tone="pos"] { color: var(--ok); }
+.tbl-delta[data-tone="neg"] { color: var(--err); }
+.tbl-delta[data-tone="zero"] { color: var(--fg-muted); }
+.tbl-cell-note { border-bottom: 1px dotted var(--fg-muted); cursor: help; }
+.tbl-note { padding: 9px 12px; border-top: 1px solid var(--border); font-size: 11.5px; color: var(--fg-muted); line-height: 1.55; }
+.tbl-empty { padding: 26px 12px; text-align: center; color: var(--fg-muted); font-size: 12.5px; }
+.tbl-export-box { border-top: 1px solid var(--border); background: var(--bg-soft); }
+.tbl-export-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px 0; font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; color: var(--fg-muted); }
+.tbl-export-close { margin-left: auto; padding: 2px 7px; font-size: 11px; border-radius: 6px; }
+.tbl-export-preview {
+  margin: 8px 12px 12px; padding: 10px 12px; max-height: 220px; overflow: auto;
+  white-space: pre; font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.55; color: var(--fg);
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 9px;
+}
+
+.chart-card { border: 1px solid var(--border); border-radius: 16px; background: var(--bg-elev); padding: 12px 12px 8px; }
+.chart-stage { position: relative; }
+.chart-svg-host { min-height: 120px; }
+.chart-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart-grid { stroke: var(--border); stroke-width: 1; }
+.chart-tick { fill: var(--fg-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.chart-axis-label { fill: var(--fg-muted); font-size: 11px; font-weight: 550; }
+.chart-ref { stroke: var(--warn); stroke-width: 1.3; stroke-dasharray: 5 4; opacity: .8; }
+.chart-ref-label { fill: var(--warn); font-size: 10.5px; }
+.chart-bar { transition: opacity .15s; }
+.chart-bar:hover { opacity: .82; }
+.chart-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart-line.dashed { stroke-dasharray: 6 4; }
+.chart-point { stroke: var(--bg); stroke-width: 1.4; }
+.chart-point:hover { stroke: var(--accent); stroke-width: 2; }
+.chart-pareto { fill: none; stroke: var(--accent); stroke-width: 1.4; stroke-dasharray: 7 4; opacity: .7; }
+.chart-point-label { fill: var(--fg-muted); font-size: 10px; pointer-events: none; }
+.chart-cell { stroke: var(--bg); stroke-width: 1; }
+.chart-cell[data-tone="good"] { fill: var(--ok); }
+.chart-cell[data-tone="bad"] { fill: var(--err); }
+.chart-cell[data-tone="strong"] { fill: var(--accent); }
+.chart-cell[data-tone="mid"] { fill: var(--accent); }
+.chart-cell-text { fill: var(--fg); font-size: 10.5px; font-variant-numeric: tabular-nums; pointer-events: none; }
+.chart-tip {
+  position: absolute; z-index: 5; max-width: 240px; padding: 5px 8px; border-radius: 7px;
+  font-size: 11px; line-height: 1.45; white-space: nowrap; pointer-events: none;
+  color: var(--fg); background: var(--bg-elev); border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+}
+.chart-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 8px 2px 4px; min-height: 28px; }
+.chart-pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px;
+  font-size: 11px; color: var(--fg-muted); background: var(--bg-soft); border: 1px solid var(--border-strong);
+}
+.chart-pill:hover { color: var(--accent); border-color: var(--accent); }
+.chart-pill[data-hidden="true"] { opacity: .45; text-decoration: line-through; }
+.chart-pill i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.chart-scale-label { font-size: 11px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.chart-note { padding: 2px 2px 4px; font-size: 11.5px; color: var(--fg-muted); line-height: 1.55; }
+
+.prose-card.markdown-body {
+  max-width: none; margin: 0; padding: 18px 20px; font-size: 14px; line-height: 1.72;
+  border: 1px solid var(--border); border-radius: 16px; background: var(--bg-elev);
+}
+.prose-card.markdown-body > :first-child { margin-top: 0; }
+.prose-card.markdown-body > :last-child { margin-bottom: 0; }
+.prose-card[data-tone="ok"] { border-color: color-mix(in srgb, var(--ok) 38%, var(--border)); }
+.prose-card[data-tone="warn"] { border-color: color-mix(in srgb, var(--warn) 38%, var(--border)); }
+.prose-card[data-tone="err"] { border-color: color-mix(in srgb, var(--err) 38%, var(--border)); }
+.prose-card[data-tone="accent"] { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+@media (max-width: 960px) {
+  .cv-sections { grid-template-columns: minmax(0, 1fr); }
+  .cv-section[data-span="1"] { grid-column: 1 / -1; }
+  .tbl-search { width: 112px; }
+}
 
 /* ---------- Inspector 抽屉 ---------- */
 #drawer {
@@ -922,7 +1060,8 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       viewer: {
         mode: 'md', subview: 'reading', format: 'md', title: '', content: '',
         currentFile: null, canvasData: null, artifactSrc: '', mtime: 0, mm: null,
-        drawer: {}, drawerSeq: 0, seq: 0
+        drawer: {}, drawerSeq: 0, seq: 0,
+        tables: {}, tableSeq: 0, charts: {}, chartSeq: 0
       }
     };
     if (name === 'primary') {
@@ -1068,7 +1207,9 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 
   function wrapTables(root) {
     $$('table', root).forEach(function (table) {
-      if (table.parentElement && table.parentElement.classList.contains('table-wrap')) return;
+      if (table.classList.contains('exp-tbl')) return;
+      if (table.parentElement && (table.parentElement.classList.contains('table-wrap') ||
+          table.parentElement.classList.contains('tbl-scroll'))) return;
       var wrap = document.createElement('div');
       wrap.className = 'table-wrap';
       table.parentNode.insertBefore(wrap, table);
@@ -1273,6 +1414,27 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       if (Array.isArray(data.cards)) out.sections.push({ type: 'bento', cards: data.cards });
       if (Array.isArray(data.steps)) out.sections.push({ type: 'steps', steps: data.steps });
       if (Array.isArray(data.kpis)) out.sections.push({ type: 'kpis', items: data.kpis });
+      if (Array.isArray(data.columns) && Array.isArray(data.rows)) {
+        out.sections.push({
+          type: 'table', title: data.section_title || '',
+          columns: data.columns, rows: data.rows, groups: data.groups,
+          baseline_id: data.baseline_id, show_delta: data.show_delta,
+          searchable: data.searchable, caption: data.caption, note: data.note,
+          span: data.span
+        });
+      }
+      if (data.chart_type || ((Array.isArray(data.matrix) || Array.isArray(data.cells))
+          && Array.isArray(data.x_labels))) {
+        var chart = {};
+        Object.keys(data).forEach(function (k) { chart[k] = data[k]; });
+        chart.type = 'chart';
+        chart.title = data.section_title || '';
+        chart.span = data.span;
+        out.sections.push(chart);
+      }
+      if (typeof data.prose === 'string') {
+        out.sections.push({ type: 'prose', title: data.section_title || '', content: data.prose, tone: data.tone, span: data.span });
+      }
     }
     return out;
   }
@@ -1291,6 +1453,1238 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }).join('') + '</div>';
   }
 
+/* ==== VR_TABLE_CORE_START ==== */
+  /* 纯表格计算，不依赖 DOM；test_visual_reply.py 会把这段抽出来在 node vm 里跑。 */
+  var TableCore = (function () {
+    'use strict';
+
+    var EPS = 1e-9;
+
+    function finite(v) {
+      if (v === null || v === undefined || v === '' || typeof v === 'boolean') return null;
+      var n = Number(v);
+      return isFinite(n) ? n : null;
+    }
+
+    function parseCell(raw) {
+      var out = { raw: raw, num: null, text: '', note: '', status: '', hasDisplay: false };
+      if (raw === null || raw === undefined) return out;
+      if (typeof raw === 'object') {
+        var value = raw.value;
+        out.note = raw.note === null || raw.note === undefined ? '' : String(raw.note);
+        out.status = raw.status === null || raw.status === undefined ? '' : String(raw.status);
+        if (typeof raw.display === 'string') {
+          out.hasDisplay = true;
+          out.text = raw.display;
+        } else {
+          out.text = value === null || value === undefined ? '' : String(value);
+        }
+        out.num = finite(value);
+        return out;
+      }
+      out.text = String(raw);
+      out.num = finite(raw);
+      return out;
+    }
+
+    function getCell(row, key) {
+      if (!row || typeof row !== 'object' || !key) return parseCell(undefined);
+      var raw;
+      if (row.cells && typeof row.cells === 'object'
+          && Object.prototype.hasOwnProperty.call(row.cells, key)) {
+        raw = row.cells[key];
+      } else if (Object.prototype.hasOwnProperty.call(row, key)) {
+        raw = row[key];
+      }
+      return parseCell(raw);
+    }
+
+    function isBlankCell(cell) {
+      if (!cell || cell.num !== null) return false;
+      var text = String(cell.text || '').trim().toLowerCase();
+      return text === '' || text === '-' || text === '--' || text === '\u2014'
+        || text === '\u2013' || text === 'n/a' || text === 'na' || text === 'null';
+    }
+
+    function effectiveHighlight(col) {
+      if (!col || typeof col !== 'object') return 'none';
+      if (col.highlight === 'max' || col.highlight === 'min' || col.highlight === 'none') {
+        return col.highlight;
+      }
+      if (col.higher_is_better === true) return 'max';
+      if (col.higher_is_better === false) return 'min';
+      return 'none';
+    }
+
+    function rankColumns(columns, rows) {
+      var out = {};
+      (Array.isArray(columns) ? columns : []).forEach(function (col) {
+        if (!col || !col.key) return;
+        var values = [];
+        (Array.isArray(rows) ? rows : []).forEach(function (row) {
+          var num = getCell(row, col.key).num;
+          if (num === null) return;
+          for (var i = 0; i < values.length; i++) {
+            if (Math.abs(values[i] - num) < EPS) return;
+          }
+          values.push(num);
+        });
+        var mode = effectiveHighlight(col);
+        if (!values.length || mode === 'none') {
+          out[col.key] = { best: null, second: null };
+          return;
+        }
+        values.sort(function (a, b) { return mode === 'max' ? b - a : a - b; });
+        out[col.key] = { best: values[0], second: values.length > 1 ? values[1] : null };
+      });
+      return out;
+    }
+
+    function inferDecimals(col, values) {
+      if (col && typeof col.decimals === 'number' && isFinite(col.decimals) && col.decimals >= 0) {
+        return Math.max(0, Math.min(4, Math.round(col.decimals)));
+      }
+      var fractional = false;
+      (Array.isArray(values) ? values : []).forEach(function (raw) {
+        var num = finite(raw);
+        if (num === null) return;
+        if (Math.abs(num - Math.round(num)) > EPS) fractional = true;
+      });
+      return fractional ? 1 : 0;
+    }
+
+    function formatNumber(value, decimals) {
+      var num = finite(value);
+      if (num === null) return '';
+      var d = finite(decimals);
+      d = d === null ? 2 : Math.max(0, Math.min(4, Math.round(d)));
+      var text = num.toFixed(d);
+      if (/^-0(\.0+)?$/.test(text)) text = text.slice(1);
+      return text;
+    }
+
+    function computeDelta(num, baseNum, col, decimals) {
+      var cur = finite(num);
+      var base = finite(baseNum);
+      if (cur === null || base === null) return null;
+      var diff = cur - base;
+      var d = finite(decimals);
+      d = d === null ? 2 : Math.max(0, Math.min(4, Math.round(d)));
+      var body = Math.abs(diff).toFixed(d);
+      if (body.indexOf('.') >= 0) body = body.replace(/0+$/, '').replace(/\.$/, '');
+      var sign = diff > EPS ? '+' : (diff < -EPS ? '-' : '');
+      var unit = col && col.delta_unit ? String(col.delta_unit) : '';
+      var tone = 'zero';
+      if (Math.abs(diff) >= EPS) {
+        var higherBetter = !(col && col.higher_is_better === false);
+        tone = (diff > 0) === higherBetter ? 'pos' : 'neg';
+      }
+      return { diff: diff, text: sign + body + unit, tone: tone };
+    }
+
+    function sortRows(rows, colKey, dir, pinnedTopIds) {
+      var pinned = {};
+      (Array.isArray(pinnedTopIds) ? pinnedTopIds : []).forEach(function (id) {
+        pinned[String(id)] = true;
+      });
+      var sign = dir === 'asc' ? 1 : -1;
+      var decorated = (Array.isArray(rows) ? rows : []).map(function (row, idx) {
+        return { row: row, idx: idx };
+      });
+      decorated.sort(function (a, b) {
+        var pinA = pinned[String(a.row && a.row.id)] ? 1 : 0;
+        var pinB = pinned[String(b.row && b.row.id)] ? 1 : 0;
+        if (pinA !== pinB) return pinB - pinA;
+        var cellA = getCell(a.row, colKey);
+        var cellB = getCell(b.row, colKey);
+        var blankA = isBlankCell(cellA);
+        var blankB = isBlankCell(cellB);
+        if (blankA !== blankB) return blankA ? 1 : -1;
+        if (blankA && blankB) return a.idx - b.idx;
+        if (cellA.num !== null && cellB.num !== null) {
+          if (Math.abs(cellA.num - cellB.num) > EPS) return sign * (cellA.num - cellB.num);
+          return a.idx - b.idx;
+        }
+        if (cellA.num !== null) return -1;
+        if (cellB.num !== null) return 1;
+        var cmp = String(cellA.text).localeCompare(String(cellB.text));
+        return cmp !== 0 ? sign * cmp : a.idx - b.idx;
+      });
+      return decorated.map(function (item) { return item.row; });
+    }
+
+    function filterRows(rows, columns, query) {
+      var needle = String(query === null || query === undefined ? '' : query).trim().toLowerCase();
+      var list = Array.isArray(rows) ? rows : [];
+      if (!needle) return list.slice();
+      var cols = (Array.isArray(columns) ? columns : []).filter(function (c) { return c && c.key; });
+      return list.filter(function (row) {
+        var parts = [];
+        if (cols.length) {
+          cols.forEach(function (col) { parts.push(getCell(row, col.key).text); });
+        } else {
+          Object.keys(row || {}).forEach(function (key) {
+            if (key === 'details' || key === 'files' || key === 'cells') return;
+            parts.push(parseCell(row[key]).text);
+          });
+        }
+        return parts.join(' ').toLowerCase().indexOf(needle) >= 0;
+      });
+    }
+
+    function normalizeRows(rows) {
+      return (Array.isArray(rows) ? rows : []).map(function (row, idx) {
+        var copy = {};
+        Object.keys(row || {}).forEach(function (key) { copy[key] = row[key]; });
+        var id = row && row.id !== undefined && row.id !== null ? String(row.id) : '';
+        copy.id = id || 'r' + idx;
+        return copy;
+      });
+    }
+
+    function resolveBaselineId(rows, explicitId) {
+      var list = Array.isArray(rows) ? rows : [];
+      var target = explicitId === null || explicitId === undefined ? '' : String(explicitId);
+      if (target) {
+        for (var i = 0; i < list.length; i++) {
+          if (String((list[i] && list[i].id) || '') === target) return target;
+        }
+      }
+      for (var j = 0; j < list.length; j++) {
+        if (list[j] && list[j].is_baseline) return String(list[j].id || '');
+      }
+      return '';
+    }
+
+    function normalizeGroups(columns, groups) {
+      var cols = Array.isArray(columns) ? columns : [];
+      if (!Array.isArray(groups) || !groups.length) return [];
+      var indexOf = {};
+      cols.forEach(function (col, i) { indexOf[col.key] = i; });
+      var out = [];
+      var cursor = 0;
+      groups.forEach(function (group) {
+        if (!group) return;
+        var start = cursor;
+        var span = 0;
+        if (Array.isArray(group.cols) && group.cols.length) {
+          var indexes = [];
+          group.cols.forEach(function (key) {
+            if (Object.prototype.hasOwnProperty.call(indexOf, key)) indexes.push(indexOf[key]);
+          });
+          if (!indexes.length) return;
+          start = Math.min.apply(null, indexes);
+          var end = Math.max.apply(null, indexes);
+          span = end - start + 1;
+          var expected = cols.slice(start, end + 1).map(function (col) { return col.key; });
+          if (expected.length !== group.cols.length) return;
+          for (var k = 0; k < expected.length; k++) {
+            if (expected[k] !== group.cols[k]) return;
+          }
+        } else {
+          span = Math.round(Number(group.span) || 0);
+          start = cursor;
+        }
+        if (span <= 0 || start + span > cols.length) return;
+        out.push({ label: String(group.label || ''), span: span, start: start });
+        cursor = start + span;
+      });
+      out.sort(function (a, b) { return a.start - b.start; });
+      var prevEnd = 0;
+      for (var i = 0; i < out.length; i++) {
+        if (out[i].start < prevEnd) return [];
+        prevEnd = out[i].start + out[i].span;
+      }
+      return out;
+    }
+
+    function escapeLatex(text) {
+      var sentinel = '@@VRBS@@';
+      var value = text === null || text === undefined ? '' : String(text);
+      return value
+        .replace(/\\/g, sentinel)
+        .replace(/&/g, '\\&')
+        .replace(/%/g, '\\%')
+        .replace(/\$/g, '\\$')
+        .replace(/#/g, '\\#')
+        .replace(/_/g, '\\_')
+        .replace(/\{/g, '\\{')
+        .replace(/\}/g, '\\}')
+        .replace(/~/g, '\\textasciitilde{}')
+        .replace(/\^/g, '\\textasciicircum{}')
+        .replace(new RegExp(sentinel, 'g'), '\\textbackslash{}');
+    }
+
+    function alignOf(col, rows) {
+      if (col.align === 'left' || col.align === 'center' || col.align === 'right') return col.align;
+      var numeric = (Array.isArray(rows) ? rows : []).some(function (row) {
+        return getCell(row, col.key).num !== null;
+      });
+      return numeric ? 'right' : 'left';
+    }
+
+    function headerLabel(col) {
+      var label = col.label === undefined || col.label === null ? String(col.key) : String(col.label);
+      return col.unit ? label + ' (' + col.unit + ')' : label;
+    }
+
+    function cellExportText(cell, col, decimals) {
+      if (cell.hasDisplay) return cell.text;
+      if (cell.num !== null) return formatNumber(cell.num, decimals);
+      return cell.text;
+    }
+
+    function toLatex(columns, rows, groups, opts) {
+      var cols = (Array.isArray(columns) ? columns : []).filter(function (c) { return c && c.key; });
+      if (!cols.length) return '';
+      var list = Array.isArray(rows) ? rows : [];
+      var options = opts || {};
+      var ranks = rankColumns(cols, list);
+      var layout = cols.map(function (col) { return alignOf(col, list); })
+        .map(function (a) { return a === 'right' ? 'r' : (a === 'center' ? 'c' : 'l'); }).join('');
+      var decimals = {};
+      cols.forEach(function (col) {
+        decimals[col.key] = inferDecimals(col, list.map(function (row) {
+          return getCell(row, col.key).num;
+        }));
+      });
+      var lines = [];
+      if (options.caption) {
+        lines.push('\\begin{table}[htbp]');
+        lines.push('\\centering');
+      }
+      lines.push('\\begin{tabular}{' + layout + '}');
+      lines.push('\\toprule');
+      var blocks = normalizeGroups(cols, groups);
+      if (blocks.length) {
+        var groupCells = [];
+        var rules = [];
+        var cursor = 0;
+        blocks.forEach(function (block) {
+          while (cursor < block.start) { groupCells.push(''); cursor += 1; }
+          groupCells.push('\\multicolumn{' + block.span + '}{c}{' + escapeLatex(block.label) + '}');
+          rules.push('\\cmidrule(lr){' + (block.start + 1) + '-' + (block.start + block.span) + '}');
+          cursor = block.start + block.span;
+        });
+        while (cursor < cols.length) { groupCells.push(''); cursor += 1; }
+        lines.push(groupCells.join(' & ') + ' \\\\');
+        lines.push(rules.join(' '));
+      }
+      lines.push(cols.map(function (col) {
+        return escapeLatex(col.label === undefined || col.label === null ? col.key : col.label);
+      }).join(' & ') + ' \\\\');
+      lines.push('\\midrule');
+      list.forEach(function (row, rowIdx) {
+        if (rowIdx > 0 && row && row.divider_before) lines.push('\\midrule');
+        if (rowIdx === list.length - 1 && list.length > 1 && row && row.emphasis && !row.divider_before) {
+          lines.push('\\midrule');
+        }
+        var cells = cols.map(function (col) {
+          var cell = getCell(row, col.key);
+          var text;
+          if (cell.num !== null && !cell.hasDisplay) {
+            text = formatNumber(cell.num, decimals[col.key]);
+            var rank = ranks[col.key];
+            if (rank && rank.best !== null && Math.abs(cell.num - rank.best) < EPS) {
+              text = '\\textbf{' + text + '}';
+            } else if (rank && rank.second !== null && Math.abs(cell.num - rank.second) < EPS) {
+              text = '\\underline{' + text + '}';
+            }
+          } else {
+            text = escapeLatex(cell.text);
+          }
+          return text;
+        });
+        lines.push(cells.join(' & ') + ' \\\\');
+      });
+      lines.push('\\bottomrule');
+      lines.push('\\end{tabular}');
+      if (options.caption) {
+        lines.push('\\caption{' + escapeLatex(options.caption) + '}');
+        lines.push('\\end{table}');
+      }
+      return lines.join('\n');
+    }
+
+    function toMarkdown(columns, rows, opts) {
+      var cols = (Array.isArray(columns) ? columns : []).filter(function (c) { return c && c.key; });
+      if (!cols.length) return '';
+      var list = Array.isArray(rows) ? rows : [];
+      var ranks = rankColumns(cols, list);
+      var decimals = {};
+      cols.forEach(function (col) {
+        decimals[col.key] = inferDecimals(col, list.map(function (row) {
+          return getCell(row, col.key).num;
+        }));
+      });
+      function mdText(text) {
+        return String(text === null || text === undefined ? '' : text)
+          .replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+      }
+      var head = '| ' + cols.map(function (col) { return mdText(headerLabel(col)); }).join(' | ') + ' |';
+      var sep = '| ' + cols.map(function (col) {
+        var align = alignOf(col, list);
+        return align === 'center' ? ':---:' : (align === 'right' ? '---:' : ':---');
+      }).join(' | ') + ' |';
+      var body = list.map(function (row) {
+        return '| ' + cols.map(function (col) {
+          var cell = getCell(row, col.key);
+          var text = mdText(cellExportText(cell, col, decimals[col.key]));
+          if (cell.num !== null && !cell.hasDisplay) {
+            var rank = ranks[col.key];
+            if (rank && rank.best !== null && Math.abs(cell.num - rank.best) < EPS) text = '**' + text + '**';
+            else if (rank && rank.second !== null && Math.abs(cell.num - rank.second) < EPS) text = '__' + text + '__';
+          }
+          return text;
+        }).join(' | ') + ' |';
+      });
+      return [head, sep].concat(body).join('\n');
+    }
+
+    function csvCell(value) {
+      var text = value === null || value === undefined ? '' : String(value);
+      if (/[",\r\n]/.test(text)) return '"' + text.replace(/"/g, '""') + '"';
+      return text;
+    }
+
+    function toCsv(columns, rows) {
+      var cols = (Array.isArray(columns) ? columns : []).filter(function (c) { return c && c.key; });
+      if (!cols.length) return '';
+      var list = Array.isArray(rows) ? rows : [];
+      var decimals = {};
+      cols.forEach(function (col) {
+        decimals[col.key] = inferDecimals(col, list.map(function (row) {
+          return getCell(row, col.key).num;
+        }));
+      });
+      var lines = [cols.map(function (col) { return csvCell(headerLabel(col)); }).join(',')];
+      list.forEach(function (row) {
+        lines.push(cols.map(function (col) {
+          var cell = getCell(row, col.key);
+          return csvCell(cellExportText(cell, col, decimals[col.key]));
+        }).join(','));
+      });
+      return lines.join('\r\n');
+    }
+
+    return {
+      finite: finite,
+      parseCell: parseCell,
+      getCell: getCell,
+      isBlankCell: isBlankCell,
+      effectiveHighlight: effectiveHighlight,
+      rankColumns: rankColumns,
+      inferDecimals: inferDecimals,
+      formatNumber: formatNumber,
+      computeDelta: computeDelta,
+      sortRows: sortRows,
+      filterRows: filterRows,
+      normalizeRows: normalizeRows,
+      resolveBaselineId: resolveBaselineId,
+      normalizeGroups: normalizeGroups,
+      alignOf: alignOf,
+      headerLabel: headerLabel,
+      cellExportText: cellExportText,
+      escapeLatex: escapeLatex,
+      toLatex: toLatex,
+      toMarkdown: toMarkdown,
+      toCsv: toCsv
+    };
+  })();
+  (typeof globalThis !== 'undefined' ? globalThis : this).TableCore = TableCore;
+  /* ==== VR_TABLE_CORE_END ==== */
+/* ==== VR_CHART_CORE_START ==== */
+  /* 纯图表几何，不依赖 DOM 或任何第三方库；test_visual_reply.py 会抽出来在 node vm 里跑。 */
+  var ChartCore = (function () {
+    'use strict';
+
+    var EPS = 1e-9;
+    var PALETTE = 6;
+
+    function finite(v) {
+      if (v === null || v === undefined || v === '' || typeof v === 'boolean') return null;
+      var n = Number(v);
+      return isFinite(n) ? n : null;
+    }
+
+    function clamp(v, lo, hi) {
+      if (!isFinite(v)) return lo;
+      return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    function r2(v) {
+      if (!isFinite(v)) return 0;
+      return Math.round(v * 100) / 100;
+    }
+
+    function colorOf(index) {
+      return 'var(--vc-' + (Math.abs(Math.round(index)) % PALETTE) + ')';
+    }
+
+    function seriesKey(series, index) {
+      if (series && series.name !== undefined && series.name !== null && String(series.name) !== '') {
+        return String(series.name);
+      }
+      return 'S' + (index + 1);
+    }
+
+    function decimalsForStep(step) {
+      var s = Math.abs(finite(step) === null ? 1 : step);
+      if (!(s > 0)) return 0;
+      var d = 0;
+      while (d < 4 && Math.abs(s - Math.round(s)) > 1e-9) { s *= 10; d += 1; }
+      return d;
+    }
+
+    function formatNumber(value, decimals) {
+      var num = finite(value);
+      if (num === null) return '';
+      var d = finite(decimals);
+      d = d === null ? 2 : Math.max(0, Math.min(4, Math.round(d)));
+      var text = num.toFixed(d);
+      if (/^-0(\.0+)?$/.test(text)) text = text.slice(1);
+      return text;
+    }
+
+    function niceNum(range, round) {
+      if (!(range > 0) || !isFinite(range)) return 1;
+      var exp = Math.floor(Math.log(range) / Math.LN10);
+      var frac = range / Math.pow(10, exp);
+      var nice;
+      if (round) nice = frac < 1.5 ? 1 : (frac < 3 ? 2 : (frac < 7 ? 5 : 10));
+      else nice = frac <= 1 ? 1 : (frac <= 2 ? 2 : (frac <= 2.5 ? 2.5 : (frac <= 5 ? 5 : 10)));
+      var out = nice * Math.pow(10, exp);
+      return isFinite(out) && out > 0 ? out : 1;
+    }
+
+    function niceScale(rawMin, rawMax, targetTicks, includeZero) {
+      var lo = finite(rawMin);
+      var hi = finite(rawMax);
+      if (lo === null) lo = 0;
+      if (hi === null) hi = 0;
+      if (includeZero) {
+        lo = Math.min(lo, 0);
+        hi = Math.max(hi, 0);
+      }
+      if (!(hi > lo)) {
+        var base = Math.abs(lo) > EPS ? Math.abs(lo) : 1;
+        if (Math.abs(hi - lo) < EPS) {
+          lo = lo - base * 0.5;
+          hi = hi + base * 0.5;
+        } else {
+          var swap = lo;
+          lo = hi;
+          hi = swap;
+        }
+        if (includeZero) {
+          lo = Math.min(lo, 0);
+          hi = Math.max(hi, 0);
+        }
+        if (!(hi > lo)) hi = lo + 1;
+      }
+      var want = finite(targetTicks);
+      want = want === null ? 5 : Math.max(2, Math.min(12, Math.round(want)));
+      var step = niceNum((hi - lo) / want, true);
+      if (!(step > 0) || !isFinite(step)) step = 1;
+      var start = Math.floor((lo + step * 1e-9) / step) * step;
+      var end = Math.ceil((hi - step * 1e-9) / step) * step;
+      if (!(end > start)) end = start + step;
+      var count = Math.round((end - start) / step);
+      if (!isFinite(count) || count < 1) {
+        end = start + step;
+        count = 1;
+      }
+      if (count > 60) {
+        step = (end - start) / 60;
+        count = 60;
+      }
+      var decimals = decimalsForStep(step);
+      var ticks = [];
+      for (var i = 0; i <= count; i++) {
+        var v = start + step * i;
+        var rounded = Number(v.toFixed(Math.min(6, decimals + 2)));
+        ticks.push(isFinite(rounded) ? rounded : r2(start));
+      }
+      return {
+        min: isFinite(start) ? r2(start) : 0,
+        max: isFinite(end) ? r2(end) : 1,
+        step: step,
+        ticks: ticks,
+        decimals: decimals
+      };
+    }
+
+    function formatTick(value, step) {
+      var num = finite(value);
+      if (num === null) return '';
+      var d = decimalsForStep(finite(step) === null ? 1 : step);
+      return num.toFixed(Math.min(6, d));
+    }
+
+    function chartKind(spec) {
+      var declared = spec && (spec.chart_type || spec.subtype);
+      if (!declared) {
+        if (Array.isArray(spec && spec.points)) return 'scatter';
+        if ((Array.isArray(spec && spec.values) || Array.isArray(spec && spec.matrix)
+             || Array.isArray(spec && spec.cells))
+            && Array.isArray(spec && spec.x_labels)) return 'heatmap';
+        if (Array.isArray(spec && spec.x) && Array.isArray(spec && spec.series)) return 'line';
+        return 'bar';
+      }
+      var raw = String(declared).toLowerCase().replace(/\s+/g, '_');
+      if (raw === 'grouped_bar' || raw === 'bar_chart' || raw === 'column' || raw === 'columns') return 'bar';
+      if (raw === 'line_chart' || raw === 'lines') return 'line';
+      if (raw === 'bubble' || raw === 'pareto' || raw === 'scatter_plot') return 'scatter';
+      if (raw === 'matrix' || raw === 'heat_map') return 'heatmap';
+      return raw;
+    }
+
+    function textWidth(text) {
+      var out = 0;
+      var value = String(text === null || text === undefined ? '' : text);
+      for (var i = 0; i < value.length; i++) {
+        out += value.charCodeAt(i) > 0xff ? 12 : 6.4;
+      }
+      return out;
+    }
+
+    function clipText(text, max) {
+      var value = String(text === null || text === undefined ? '' : text);
+      if (value.length <= max) return value;
+      return value.slice(0, Math.max(1, max - 1)) + '\u2026';
+    }
+
+    function padOf(spec, kind) {
+      var left = 62;
+      if (kind === 'heatmap') left = 88;
+      if (kind === 'line' || kind === 'scatter') left = 66;
+      if (spec && spec.y_label) left += 14;
+      return { top: 26, right: 24, bottom: 54, left: left };
+    }
+
+    function plotOf(width, height, pad) {
+      var w = Math.max(40, width - pad.left - pad.right);
+      var h = Math.max(40, height - pad.top - pad.bottom);
+      return { x: pad.left, y: pad.top, w: r2(w), h: r2(h) };
+    }
+
+    function ticksWithY(scale, yOf) {
+      return (scale.ticks || []).map(function (value) {
+        return { value: value, y: r2(yOf(value)), label: formatTick(value, scale.step) };
+      });
+    }
+
+    function layoutBar(spec, frame) {
+      var plot = frame.plot;
+      var hidden = spec.hiddenSeries && typeof spec.hiddenSeries === 'object' ? spec.hiddenSeries : {};
+      var allSeries = Array.isArray(spec.series) ? spec.series : [];
+      var categories = (Array.isArray(spec.categories) ? spec.categories : []).map(function (c) {
+        return String(c === null || c === undefined ? '' : c);
+      });
+      if (!categories.length) {
+        var longest = 0;
+        allSeries.forEach(function (s) {
+          if (s && Array.isArray(s.data)) longest = Math.max(longest, s.data.length);
+        });
+        for (var i = 0; i < longest; i++) categories.push(String(i + 1));
+      }
+      var series = [];
+      allSeries.forEach(function (s, idx) {
+        if (!s) return;
+        var key = seriesKey(s, idx);
+        if (hidden[key]) return;
+        series.push({ source: s, index: idx, key: key, name: key, color: s.color || colorOf(idx) });
+      });
+      var values = [];
+      series.forEach(function (s) {
+        (Array.isArray(s.source.data) ? s.source.data : []).forEach(function (raw) {
+          var n = finite(raw);
+          if (n !== null) values.push(n);
+        });
+      });
+      var refs = (Array.isArray(spec.ref_lines) ? spec.ref_lines : []).filter(Boolean);
+      refs.forEach(function (ref) {
+        var n = finite(ref.value);
+        if (n !== null) values.push(n);
+      });
+      var lo = values.length ? values[0] : 0;
+      var hi = values.length ? values[0] : 1;
+      values.forEach(function (v) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      });
+      var scale = niceScale(lo, hi, 5, true);
+      var yMin = finite(spec.y_min);
+      var yMax = finite(spec.y_max);
+      if (yMin !== null || yMax !== null) {
+        var lo2 = yMin !== null ? yMin : scale.min;
+        var hi2 = yMax !== null ? yMax : scale.max;
+        if (!(hi2 > lo2)) hi2 = lo2 + 1;
+        var step2 = niceNum((hi2 - lo2) / 5, true);
+        var ticks2 = [];
+        for (var t = lo2, guard = 0; t <= hi2 + step2 * 1e-9 && guard < 24; t += step2, guard++) {
+          ticks2.push(Number(t.toFixed(6)));
+        }
+        if (ticks2.length < 2) ticks2 = [lo2, hi2];
+        scale = { min: lo2, max: hi2, step: step2, ticks: ticks2, decimals: decimalsForStep(step2) };
+      }
+      function yOf(value) {
+        return plot.y + plot.h - ((value - scale.min) / (scale.max - scale.min)) * plot.h;
+      }
+      var count = categories.length;
+      var bands = plot.w / Math.max(1, count);
+      var slotCount = Math.max(1, series.length);
+      var inner = bands * 0.72;
+      var slot = inner / slotCount;
+      var barW = Math.max(3, Math.min(36, slot * 0.82));
+      var zeroY = clamp(yOf(clamp(0, scale.min, scale.max)), plot.y, plot.y + plot.h);
+      var bars = [];
+      series.forEach(function (s, si) {
+        for (var ci = 0; ci < count; ci++) {
+          var raw = Array.isArray(s.source.data) ? s.source.data[ci] : null;
+          var value = finite(raw);
+          if (value === null) continue;
+          var yv = clamp(yOf(value), plot.y, plot.y + plot.h);
+          var centre = plot.x + bands * ci + bands / 2 + (si - (series.length - 1) / 2) * slot;
+          var x = clamp(centre - barW / 2, plot.x, plot.x + plot.w - barW);
+          var top = Math.min(yv, zeroY);
+          var h = Math.abs(zeroY - yv);
+          bars.push({
+            x: r2(x), y: r2(clamp(top, plot.y, plot.y + plot.h)),
+            w: r2(barW), h: r2(clamp(h, 0, plot.h)),
+            value: value, catIndex: ci, seriesIndex: s.index, seriesName: s.name,
+            category: categories[ci], color: s.color,
+            tip: categories[ci] + ' · ' + s.name + ': ' + formatNumber(value, scale.decimals) + (spec.unit || '')
+          });
+        }
+      });
+      var xLabels = categories.map(function (text, ci) {
+        return {
+          text: clipText(text, 14), x: r2(plot.x + bands * ci + bands / 2),
+          y: r2(plot.y + plot.h + 20), anchor: 'middle'
+        };
+      });
+      var refLines = refs.map(function (ref) {
+        var value = finite(ref.value);
+        if (value === null) return null;
+        return {
+          value: value, y: r2(clamp(yOf(value), plot.y, plot.y + plot.h)),
+          label: ref.label === undefined || ref.label === null ? '' : String(ref.label),
+          tone: ref.tone || 'warn'
+        };
+      }).filter(Boolean);
+      var legend = [];
+      allSeries.forEach(function (s, idx) {
+        if (!s) return;
+        var key = seriesKey(s, idx);
+        legend.push({ name: key, key: key, color: s.color || colorOf(idx), hidden: !!hidden[key] });
+      });
+      return {
+        kind: 'bar', width: frame.width, height: frame.height, pad: frame.pad, plot: plot,
+        title: spec.title || '', categories: categories, bars: bars, xLabels: xLabels,
+        yAxis: { min: scale.min, max: scale.max, step: scale.step, decimals: scale.decimals,
+          ticks: ticksWithY(scale, yOf), label: spec.y_label || '', unit: spec.unit || '' },
+        refLines: refLines, legend: legend, unit: spec.unit || ''
+      };
+    }
+
+    function layoutLine(spec, frame) {
+      var plot = frame.plot;
+      var hidden = spec.hiddenSeries && typeof spec.hiddenSeries === 'object' ? spec.hiddenSeries : {};
+      var allSeries = Array.isArray(spec.series) ? spec.series : [];
+      var xs = Array.isArray(spec.x) ? spec.x : [];
+      var numericX = xs.length > 0 && xs.every(function (v) { return finite(v) !== null; });
+      if (!xs.length) {
+        var longest = 0;
+        allSeries.forEach(function (s) {
+          if (s && Array.isArray(s.data)) longest = Math.max(longest, s.data.length);
+        });
+        for (var i = 0; i < longest; i++) xs.push(i + 1);
+      }
+      var categories = xs.map(function (v) { return String(v === null || v === undefined ? '' : v); });
+      var series = [];
+      allSeries.forEach(function (s, idx) {
+        if (!s) return;
+        var key = seriesKey(s, idx);
+        if (hidden[key]) return;
+        series.push({ source: s, index: idx, key: key, name: key, color: s.color || colorOf(idx), dashed: !!s.dashed });
+      });
+      var values = [];
+      series.forEach(function (s) {
+        (Array.isArray(s.source.data) ? s.source.data : []).forEach(function (raw) {
+          var n = finite(raw);
+          if (n !== null) values.push(n);
+        });
+      });
+      var refs = (Array.isArray(spec.ref_lines) ? spec.ref_lines : []).filter(Boolean);
+      refs.forEach(function (ref) {
+        var n = finite(ref.value);
+        if (n !== null) values.push(n);
+      });
+      var lo = values.length ? values[0] : 0;
+      var hi = values.length ? values[0] : 1;
+      values.forEach(function (v) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      });
+      var scale = niceScale(lo, hi, 5, true);
+      var yMin = finite(spec.y_min);
+      var yMax = finite(spec.y_max);
+      if (yMin !== null || yMax !== null) {
+        scale.min = yMin !== null ? yMin : scale.min;
+        scale.max = yMax !== null ? yMax : scale.max;
+        if (!(scale.max > scale.min)) scale.max = scale.min + 1;
+        scale.ticks = scale.ticks.filter(function (v) {
+          return v >= scale.min - EPS && v <= scale.max + EPS;
+        });
+        if (scale.ticks.length < 2) scale.ticks = [scale.min, scale.max];
+      }
+      function yOf(value) {
+        return plot.y + plot.h - ((value - scale.min) / (scale.max - scale.min)) * plot.h;
+      }
+      var xNums = numericX ? xs.map(function (v) { return finite(v); }) : null;
+      var xMin = 0;
+      var xMax = 1;
+      if (numericX) {
+        xMin = xNums[0];
+        xMax = xNums[0];
+        xNums.forEach(function (v) {
+          if (v < xMin) xMin = v;
+          if (v > xMax) xMax = v;
+        });
+        if (!(xMax > xMin)) {
+          var base = Math.abs(xMin) > EPS ? Math.abs(xMin) : 1;
+          xMin -= base * 0.5;
+          xMax += base * 0.5;
+        }
+      }
+      function xOf(index) {
+        if (!numericX) {
+          return categories.length <= 1
+            ? plot.x + plot.w / 2
+            : plot.x + (index / (categories.length - 1)) * plot.w;
+        }
+        return plot.x + ((xNums[index] - xMin) / (xMax - xMin)) * plot.w;
+      }
+      var lines = [];
+      var points = [];
+      series.forEach(function (s) {
+        var segments = [];
+        var current = [];
+        var data = Array.isArray(s.source.data) ? s.source.data : [];
+        for (var i = 0; i < data.length && i < categories.length; i++) {
+          var value = finite(data[i]);
+          if (value === null) {
+            if (current.length) segments.push(current);
+            current = [];
+            continue;
+          }
+          var point = {
+            x: r2(clamp(xOf(i), plot.x, plot.x + plot.w)),
+            y: r2(clamp(yOf(value), plot.y, plot.y + plot.h)),
+            value: value, xLabel: categories[i], catIndex: i,
+            seriesIndex: s.index, seriesName: s.name, color: s.color,
+            tip: categories[i] + ' · ' + s.name + ': ' + formatNumber(value, scale.decimals) + (spec.unit || '')
+          };
+          current.push(point);
+          points.push(point);
+        }
+        if (current.length) segments.push(current);
+        var d = segments.map(function (seg) {
+          return seg.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p.x + ' ' + p.y; }).join(' ');
+        }).join(' ');
+        lines.push({
+          name: s.name, key: s.key, seriesIndex: s.index, color: s.color,
+          dashed: s.dashed, d: d, segments: segments
+        });
+      });
+      var xLabels = [];
+      if (numericX) {
+        var xScale = niceScale(xMin, xMax, 4, false);
+        xLabels = xScale.ticks.map(function (v) {
+          return {
+            text: formatTick(v, xScale.step),
+            x: r2(clamp(plot.x + ((v - xMin) / (xMax - xMin)) * plot.w, plot.x, plot.x + plot.w)),
+            y: r2(plot.y + plot.h + 20), anchor: 'middle'
+          };
+        });
+      } else {
+        var every = categories.length > 10 ? Math.ceil(categories.length / 8) : 1;
+        categories.forEach(function (text, ci) {
+          if (ci % every !== 0 && ci !== categories.length - 1) return;
+          xLabels.push({
+            text: clipText(text, 12), x: r2(xOf(ci)),
+            y: r2(plot.y + plot.h + 20), anchor: 'middle'
+          });
+        });
+      }
+      var refLines = refs.map(function (ref) {
+        var value = finite(ref.value);
+        if (value === null) return null;
+        return {
+          value: value, y: r2(clamp(yOf(value), plot.y, plot.y + plot.h)),
+          label: ref.label === undefined || ref.label === null ? '' : String(ref.label),
+          tone: ref.tone || 'warn'
+        };
+      }).filter(Boolean);
+      var legend = [];
+      allSeries.forEach(function (s, idx) {
+        if (!s) return;
+        var key = seriesKey(s, idx);
+        legend.push({ name: key, key: key, color: s.color || colorOf(idx), hidden: !!hidden[key] });
+      });
+      return {
+        kind: 'line', width: frame.width, height: frame.height, pad: frame.pad, plot: plot,
+        title: spec.title || '', categories: categories, lines: lines, points: points,
+        xLabels: xLabels,
+        yAxis: { min: scale.min, max: scale.max, step: scale.step, decimals: scale.decimals,
+          ticks: ticksWithY(scale, yOf), label: spec.y_label || '', unit: spec.unit || '' },
+        refLines: refLines, legend: legend, unit: spec.unit || ''
+      };
+    }
+
+    function paretoFrontier(points, mode) {
+      if (!mode || mode === 'false') return [];
+      var list = points.slice();
+      var out = [];
+      var best = 0;
+      if (mode === 'max_y_min_x') {
+        list.sort(function (a, b) { return a.x - b.x || b.y - a.y; });
+        best = -Infinity;
+        list.forEach(function (p) {
+          if (p.y > best + EPS) { out.push(p); best = p.y; }
+        });
+        return out;
+      }
+      if (mode === 'max_xy') {
+        list.sort(function (a, b) { return b.x - a.x || b.y - a.y; });
+        best = -Infinity;
+        list.forEach(function (p) {
+          if (p.y > best + EPS) { out.push(p); best = p.y; }
+        });
+        return out.reverse();
+      }
+      if (mode === 'min_xy') {
+        list.sort(function (a, b) { return a.x - b.x || a.y - b.y; });
+        best = Infinity;
+        list.forEach(function (p) {
+          if (p.y < best - EPS) { out.push(p); best = p.y; }
+        });
+        return out;
+      }
+      return [];
+    }
+
+    function layoutScatter(spec, frame) {
+      var plot = frame.plot;
+      var rawPoints = Array.isArray(spec.points) ? spec.points : [];
+      var points = [];
+      var sizeValues = [];
+      rawPoints.forEach(function (p, index) {
+        if (!p) return;
+        var x = finite(p.x);
+        var y = finite(p.y);
+        if (x === null || y === null) return;
+        var size = finite(p.size);
+        if (size !== null) sizeValues.push(size);
+        points.push({ source: p, sourceIndex: index, x: x, y: y, size: size });
+      });
+      var xs = points.map(function (p) { return p.x; });
+      var ys = points.map(function (p) { return p.y; });
+      var xMin = xs.length ? Math.min.apply(null, xs) : 0;
+      var xMax = xs.length ? Math.max.apply(null, xs) : 1;
+      var yMin = ys.length ? Math.min.apply(null, ys) : 0;
+      var yMax = ys.length ? Math.max.apply(null, ys) : 1;
+      if (xMax - xMin < EPS) {
+        var bx = Math.abs(xMin) > EPS ? Math.abs(xMin) * 0.1 : 1;
+        xMin -= bx;
+        xMax += bx;
+      }
+      if (yMax - yMin < EPS) {
+        var by = Math.abs(yMin) > EPS ? Math.abs(yMin) * 0.1 : 1;
+        yMin -= by;
+        yMax += by;
+      }
+      var xPad = (xMax - xMin) * 0.08;
+      var yPad = (yMax - yMin) * 0.08;
+      var xScale = niceScale(finite(spec.x_min) !== null ? spec.x_min : xMin - xPad,
+        finite(spec.x_max) !== null ? spec.x_max : xMax + xPad, 4, false);
+      var yScale = niceScale(finite(spec.y_min) !== null ? spec.y_min : yMin - yPad,
+        finite(spec.y_max) !== null ? spec.y_max : yMax + yPad, 5, false);
+      function xOf(v) {
+        return plot.x + ((v - xScale.min) / (xScale.max - xScale.min)) * plot.w;
+      }
+      function yOf(v) {
+        return plot.y + plot.h - ((v - yScale.min) / (yScale.max - yScale.min)) * plot.h;
+      }
+      var sizeMin = sizeValues.length ? Math.min.apply(null, sizeValues) : 0;
+      var sizeMax = sizeValues.length ? Math.max.apply(null, sizeValues) : 1;
+      var hidden = spec.hiddenSeries && typeof spec.hiddenSeries === 'object' ? spec.hiddenSeries : {};
+      var groups = [];
+      var out = [];
+      points.forEach(function (p) {
+        var group = p.source.group === undefined || p.source.group === null ? '' : String(p.source.group);
+        if (group && groups.indexOf(group) < 0) groups.push(group);
+        var groupIndex = group ? groups.indexOf(group) : 0;
+        if (group && hidden[group]) return;
+        var radius = 6;
+        if (p.size !== null && sizeValues.length) {
+          var t = sizeMax - sizeMin < EPS ? 0.5 : (p.size - sizeMin) / (sizeMax - sizeMin);
+          radius = 5 + t * 11;
+        }
+        out.push({
+          index: p.sourceIndex,
+          label: p.source.label === undefined || p.source.label === null ? '' : String(p.source.label),
+          x: r2(clamp(xOf(p.x), plot.x, plot.x + plot.w)),
+          y: r2(clamp(yOf(p.y), plot.y, plot.y + plot.h)),
+          r: r2(radius),
+          value: p.y,
+          xValue: p.x,
+          group: group,
+          groupIndex: groupIndex,
+          color: p.source.highlight ? 'var(--warn)' : colorOf(groupIndex),
+          onFrontier: false,
+          tip: (p.source.label === undefined || p.source.label === null ? '' : String(p.source.label))
+            + ': ' + (spec.x_label || 'x') + ' ' + formatNumber(p.x, 2)
+            + ', ' + (spec.y_label || 'y') + ' ' + formatNumber(p.y, 2)
+        });
+      });
+      var frontier = paretoFrontier(out.map(function (p) {
+        return { ref: p, x: p.xValue, y: p.value };
+      }), spec.pareto || false);
+      var frontierRefs = frontier.map(function (item) { return item.ref; });
+      frontierRefs.forEach(function (p) { p.onFrontier = true; });
+      var paretoPath = frontierRefs.length
+        ? frontierRefs.map(function (p, i) { return (i === 0 ? 'M' : 'L') + p.x + ' ' + p.y; }).join(' ')
+        : '';
+      var placed = [];
+      var offsets = [[9, -9], [9, 15], [-9, -9], [-9, 15], [0, -17], [0, 21]];
+      out.forEach(function (p) {
+        var width = Math.max(18, textWidth(p.label) + 4);
+        var chosen = offsets[0];
+        for (var oi = 0; oi < offsets.length; oi++) {
+          var ox = offsets[oi][0];
+          var oy = offsets[oi][1];
+          var lx = clamp(p.x + ox, plot.x + 2, plot.x + plot.w - width - 2);
+          var ly = clamp(p.y + oy, plot.y + 12, plot.y + plot.h - 4);
+          var hit = false;
+          for (var pi = 0; pi < placed.length; pi++) {
+            var q = placed[pi];
+            if (Math.abs(q.x - lx) < (q.w + width) / 2 && Math.abs(q.y - ly) < 14) { hit = true; break; }
+          }
+          if (!hit) {
+            chosen = [lx, ly, width];
+            break;
+          }
+          if (oi === offsets.length - 1) chosen = [lx, ly, width];
+        }
+        p.labelX = r2(clamp(chosen[0], plot.x + 2, plot.x + plot.w - width - 2));
+        p.labelY = r2(clamp(chosen[1], plot.y + 12, plot.y + plot.h - 4));
+        p.labelAnchor = p.labelX >= p.x ? 'start' : 'end';
+        placed.push({ x: p.labelX, y: p.labelY, w: width });
+      });
+      var xLabels = (xScale.ticks || []).map(function (v) {
+        return {
+          text: formatTick(v, xScale.step),
+          x: r2(clamp(xOf(v), plot.x, plot.x + plot.w)),
+          y: r2(plot.y + plot.h + 20), anchor: 'middle'
+        };
+      });
+      var legend = groups.map(function (group, idx) {
+        return { name: group, key: group, color: colorOf(idx), hidden: !!hidden[group] };
+      });
+      return {
+        kind: 'scatter', width: frame.width, height: frame.height, pad: frame.pad, plot: plot,
+        title: spec.title || '', points: out, paretoPath: paretoPath, frontier: frontierRefs,
+        xLabels: xLabels,
+        xAxis: { min: xScale.min, max: xScale.max, step: xScale.step, decimals: xScale.decimals,
+          ticks: (xScale.ticks || []).map(function (v) {
+            return { value: v, x: r2(clamp(xOf(v), plot.x, plot.x + plot.w)), label: formatTick(v, xScale.step) };
+          }), label: spec.x_label || '', unit: spec.x_unit || '' },
+        yAxis: { min: yScale.min, max: yScale.max, step: yScale.step, decimals: yScale.decimals,
+          ticks: ticksWithY(yScale, yOf), label: spec.y_label || '', unit: spec.y_unit || '' },
+        legend: legend
+      };
+    }
+
+    function detailAt(details, row, col) {
+      if (!details) return null;
+      if (Array.isArray(details)) {
+        var line = details[row];
+        if (!Array.isArray(line)) return null;
+        var cell = line[col];
+        return cell && typeof cell === 'object' ? cell : null;
+      }
+      if (typeof details === 'object') {
+        return details[row + ',' + col] || details[row + ':' + col] || null;
+      }
+      return null;
+    }
+
+    function layoutHeatmap(spec, frame) {
+      var plot = frame.plot;
+      var xLabelsIn = (Array.isArray(spec.x_labels) ? spec.x_labels : []).map(String);
+      var yLabelsIn = (Array.isArray(spec.y_labels) ? spec.y_labels : []).map(String);
+      var source = Array.isArray(spec.values) ? spec.values : (Array.isArray(spec.matrix) ? spec.matrix : []);
+      var rows = Math.max(yLabelsIn.length, source.length);
+      var cols = xLabelsIn.length;
+      source.forEach(function (line) {
+        if (Array.isArray(line)) cols = Math.max(cols, line.length);
+      });
+      (Array.isArray(spec.cells) ? spec.cells : []).forEach(function (cell) {
+        if (!cell) return;
+        var r = finite(cell.row);
+        var c = finite(cell.col);
+        if (r === null || c === null) return;
+        rows = Math.max(rows, Math.round(r) + 1);
+        cols = Math.max(cols, Math.round(c) + 1);
+      });
+      while (xLabelsIn.length < cols) xLabelsIn.push(String(xLabelsIn.length + 1));
+      while (yLabelsIn.length < rows) yLabelsIn.push(String(yLabelsIn.length + 1));
+      var grid = [];
+      var values = [];
+      for (var ri = 0; ri < rows; ri++) {
+        grid.push([]);
+        for (var ci = 0; ci < cols; ci++) {
+          var raw = Array.isArray(source[ri]) ? source[ri][ci] : null;
+          var value = finite(raw);
+          grid[ri].push(value);
+          if (value !== null) values.push(value);
+        }
+      }
+      var sparse = Array.isArray(spec.cells) ? spec.cells : [];
+      sparse.forEach(function (cell, index) {
+        if (!cell) return;
+        var r = finite(cell.row);
+        var c = finite(cell.col);
+        var v = finite(cell.value);
+        if (r === null || c === null) return;
+        var ri = Math.round(r);
+        var ci = Math.round(c);
+        if (ri < 0 || ci < 0 || ri >= rows || ci >= cols) return;
+        grid[ri][ci] = v;
+        if (v !== null) values.push(v);
+      });
+      var min = finite(spec.min);
+      var max = finite(spec.max);
+      if (min === null) min = values.length ? Math.min.apply(null, values) : 0;
+      if (max === null) max = values.length ? Math.max.apply(null, values) : 1;
+      if (!(max > min)) {
+        var base = Math.abs(min) > EPS ? Math.abs(min) : 1;
+        min -= base * 0.5;
+        max += base * 0.5;
+      }
+      var mode = spec.scale_mode || 'max_good';
+      var decimals = finite(spec.decimals);
+      decimals = decimals === null ? (max - min < 10 ? 2 : (max - min < 100 ? 1 : 0)) : Math.round(decimals);
+      var cw = plot.w / Math.max(1, cols);
+      var ch = plot.h / Math.max(1, rows);
+      var cells = [];
+      for (var y = 0; y < rows; y++) {
+        for (var x = 0; x < cols; x++) {
+          var val = grid[y][x];
+          var norm = val === null ? 0 : clamp((val - min) / (max - min), 0, 1);
+          var alpha;
+          if (mode === 'min_good') alpha = 0.10 + 0.82 * (1 - norm);
+          else if (mode === 'neutral') alpha = 0.10 + 0.82 * (1 - Math.abs(norm - 0.5) * 2);
+          else alpha = 0.10 + 0.82 * norm;
+          var tone = 'mid';
+          if (mode === 'max_good') tone = norm >= 0.66 ? 'good' : (norm <= 0.33 ? 'bad' : 'mid');
+          else if (mode === 'min_good') tone = norm <= 0.33 ? 'good' : (norm >= 0.66 ? 'bad' : 'mid');
+          else tone = Math.abs(norm - 0.5) < 0.2 ? 'mid' : 'strong';
+          var detail = detailAt(spec.cell_details, y, x);
+          var sparseCell = null;
+          for (var si = 0; si < sparse.length; si++) {
+            var sc = sparse[si];
+            if (!sc) continue;
+            var sr = finite(sc.row);
+            var scx = finite(sc.col);
+            if (sr === null || scx === null) continue;
+            if (Math.round(sr) === y && Math.round(scx) === x) {
+              sparseCell = sc;
+              break;
+            }
+          }
+          cells.push({
+            x: r2(clamp(plot.x + x * cw, plot.x, plot.x + plot.w)),
+            y: r2(clamp(plot.y + y * ch, plot.y, plot.y + plot.h)),
+            w: r2(Math.max(1, cw - 2)),
+            h: r2(Math.max(1, ch - 2)),
+            row: y, col: x, value: val,
+            text: val === null ? '' : formatNumber(val, decimals),
+            norm: r2(norm), alpha: r2(alpha), tone: tone,
+            xLabel: xLabelsIn[x], yLabel: yLabelsIn[y],
+            sparseIndex: sparseCell ? sparse.indexOf(sparseCell) : null,
+            summary: (detail && detail.summary) || (sparseCell && sparseCell.summary) || '',
+            details: (detail && detail.details) || (sparseCell && sparseCell.details) || '',
+            files: (detail && detail.files) || (sparseCell && sparseCell.files) || [],
+            tip: yLabelsIn[y] + ' × ' + xLabelsIn[x] + ': '
+              + (val === null ? '—' : formatNumber(val, decimals) + (spec.unit || ''))
+          });
+        }
+      }
+      var xLabels = xLabelsIn.map(function (text, ci) {
+        return {
+          text: clipText(text, 12), x: r2(plot.x + cw * ci + cw / 2),
+          y: r2(plot.y + plot.h + 20), anchor: 'middle'
+        };
+      });
+      var yLabels = yLabelsIn.map(function (text, ri) {
+        return {
+          text: clipText(text, 14), x: r2(plot.x - 10),
+          y: r2(plot.y + ch * ri + ch / 2 + 4), anchor: 'end'
+        };
+      });
+      return {
+        kind: 'heatmap', width: frame.width, height: frame.height, pad: frame.pad, plot: plot,
+        title: spec.title || '', cells: cells, rows: rows, cols: cols,
+        xLabels: xLabels, yLabels: yLabels,
+        scale: { min: min, max: max, mode: mode, unit: spec.unit || '' },
+        scaleLabel: formatNumber(min, decimals) + ' \u2192 ' + formatNumber(max, decimals),
+        legend: []
+      };
+    }
+
+    function layoutChart(spec) {
+      var src = spec && typeof spec === 'object' ? spec : {};
+      var kind = chartKind(src);
+      if (['bar', 'line', 'scatter', 'heatmap'].indexOf(kind) < 0) kind = 'bar';
+      var width = finite(src.width);
+      width = width === null ? 720 : Math.max(360, Math.min(1200, Math.round(width)));
+      var height = finite(src.height);
+      if (height === null) {
+        height = kind === 'heatmap' ? 320 : (kind === 'bar' ? 340 : 360);
+        if (kind === 'heatmap' && Array.isArray(src.y_labels)) {
+          height = Math.max(260, Math.min(520, 120 + src.y_labels.length * 34));
+        }
+      }
+      height = Math.max(220, Math.min(720, Math.round(height)));
+      var pad = padOf(src, kind);
+      var frame = { width: width, height: height, pad: pad, plot: plotOf(width, height, pad) };
+      if (kind === 'line') return layoutLine(src, frame);
+      if (kind === 'scatter') return layoutScatter(src, frame);
+      if (kind === 'heatmap') return layoutHeatmap(src, frame);
+      return layoutBar(src, frame);
+    }
+
+    return {
+      finite: finite,
+      clamp: clamp,
+      niceNum: niceNum,
+      niceScale: niceScale,
+      formatTick: formatTick,
+      formatNumber: formatNumber,
+      chartKind: chartKind,
+      layoutChart: layoutChart,
+      layoutBar: layoutBar,
+      layoutLine: layoutLine,
+      layoutScatter: layoutScatter,
+      layoutHeatmap: layoutHeatmap,
+      paretoFrontier: paretoFrontier
+    };
+  })();
+  (typeof globalThis !== 'undefined' ? globalThis : this).ChartCore = ChartCore;
+  /* ==== VR_CHART_CORE_END ==== */
 /* ==== VR_GRAPH_CORE_START ==== */
   /* 纯几何计算，不依赖 DOM；test_visual_reply.py 会把这段抽出来在 node vm 里跑。 */
   var GraphCore = (function () {
@@ -2013,6 +3407,574 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }).join('') + '</div>';
   }
 
+  function tableRowKey(pane, row, columns) {
+    var notes = [];
+    columns.forEach(function (col) {
+      var cell = TableCore.getCell(row, col.key);
+      if (cell.note) notes.push((col.label || col.key) + '：' + cell.note);
+    });
+    var hasFiles = Array.isArray(row.files) && row.files.length > 0;
+    if (!row.details && !row.summary && !hasFiles && !notes.length) return '';
+    var details = row.details || '';
+    if (notes.length) details = (details ? details + '\n\n' : '') + notes.map(function (line) {
+      return '- ' + line;
+    }).join('\n');
+    var title = row.label || row.name || '';
+    if (!title) {
+      var first = TableCore.getCell(row, columns[0].key);
+      title = first.text || row.id;
+    }
+    return registerDrawer(pane, {
+      kicker: '表格行详情',
+      title: title,
+      tags: [row.is_baseline ? '基准' : '', row.emphasis ? '汇总' : ''].filter(Boolean),
+      summary: row.summary || '',
+      details: details,
+      files: row.files || []
+    });
+  }
+
+  function tableHeadHtml(state) {
+    var columns = state.columns;
+    var html = '<thead>';
+    var groups = TableCore.normalizeGroups(columns, state.groups);
+    if (groups.length) {
+      html += '<tr class="tbl-group-row"><th class="tbl-act-head"></th>';
+      var cursor = 0;
+      groups.forEach(function (group) {
+        if (group.start > cursor) {
+          html += '<th colspan="' + (group.start - cursor) + '"></th>';
+        }
+        html += '<th colspan="' + group.span + '" class="tbl-group-th">' + escapeHtml(group.label) + '</th>';
+        cursor = group.start + group.span;
+      });
+      if (cursor < columns.length) {
+        html += '<th colspan="' + (columns.length - cursor) + '"></th>';
+      }
+      html += '</tr>';
+    }
+    html += '<tr><th class="tbl-act-head" scope="col"></th>';
+    columns.forEach(function (col) {
+      var active = state.sortKey === col.key;
+      var align = TableCore.alignOf(col, state.rows);
+      html += '<th scope="col" data-tcol="' + escapeAttr(col.key) + '"' +
+        (active ? ' class="sorted"' : '') + ' style="text-align:' + align + '">' +
+        escapeHtml(col.label === undefined || col.label === null ? col.key : col.label) +
+        (col.unit ? ' <span class="tbl-unit">(' + escapeHtml(col.unit) + ')</span>' : '') +
+        '<span class="tbl-sort">' + (active ? (state.sortDir === 'asc' ? '↑' : '↓') : '') + '</span></th>';
+    });
+    html += '</tr></thead>';
+    return html;
+  }
+
+  function tableCellHtml(state, row, col, baseRow) {
+    var cell = TableCore.getCell(row, col.key);
+    var decimals = state.decimals[col.key];
+    var text = TableCore.cellExportText(cell, col, decimals);
+    var classes = [];
+    var rank = state.ranks[col.key];
+    if (cell.num !== null && rank && rank.best !== null && Math.abs(cell.num - rank.best) < 1e-9) {
+      classes.push('tbl-best');
+    } else if (cell.num !== null && rank && rank.second !== null && Math.abs(cell.num - rank.second) < 1e-9) {
+      classes.push('tbl-second');
+    }
+    if (cell.note) classes.push('tbl-cell-note');
+    var inner = escapeHtml(text);
+    if (classes.length || cell.note) {
+      inner = '<span class="' + classes.join(' ') + '"' +
+        (cell.note ? ' title="' + escapeAttr(cell.note) + '"' : '') + '>' + inner + '</span>';
+    }
+    if (state.showDelta && baseRow && row.id !== state.baselineId && cell.num !== null) {
+      var baseCell = TableCore.getCell(baseRow, col.key);
+      var delta = TableCore.computeDelta(cell.num, baseCell.num, col, decimals);
+      if (delta) {
+        inner += '<span class="tbl-delta" data-tone="' + delta.tone + '">&#916; ' + escapeHtml(delta.text) + '</span>';
+      }
+    }
+    return '<td style="text-align:' + TableCore.alignOf(col, state.rows) + '">' + inner + '</td>';
+  }
+
+  function tableBodyHtml(state) {
+    var baseRow = null;
+    if (state.baselineId) {
+      for (var i = 0; i < state.rows.length; i++) {
+        if (String(state.rows[i].id) === String(state.baselineId)) { baseRow = state.rows[i]; break; }
+      }
+    }
+    var rows = TableCore.filterRows(state.rows, state.columns, state.query);
+    if (state.sortKey) {
+      rows = TableCore.sortRows(rows, state.sortKey, state.sortDir, state.baselineId ? [state.baselineId] : []);
+    }
+    var html = '';
+    rows.forEach(function (row) {
+      var classes = [];
+      if (String(row.id) === String(state.baselineId)) classes.push('is-base');
+      if (row.emphasis) classes.push('emph');
+      if (row.divider_before) classes.push('divider');
+      var key = state.rowKeys[row.id] || '';
+      html += '<tr' + (classes.length ? ' class="' + classes.join(' ') + '"' : '') +
+        (key ? ' data-drawer="' + key + '"' : '') + '>';
+      html += '<td class="tbl-act">';
+      if (String(row.id) === String(state.baselineId)) {
+        html += '<span class="tbl-base-tag">基准</span>';
+      } else {
+        html += '<button type="button" class="tbl-base-btn" data-base-row="' + escapeAttr(row.id) + '">设为基准</button>';
+      }
+      html += '</td>';
+      state.columns.forEach(function (col) { html += tableCellHtml(state, row, col, baseRow); });
+      html += '</tr>';
+    });
+    if (!html) {
+      html = '<tr><td class="tbl-empty" colspan="' + (state.columns.length + 1) + '">没有匹配的行</td></tr>';
+    }
+    return html;
+  }
+
+  function tableExportText(state, kind) {
+    if (kind === 'latex') {
+      return TableCore.toLatex(state.columns, state.rows, state.groups, { caption: state.caption });
+    }
+    if (kind === 'md') return TableCore.toMarkdown(state.columns, state.rows, {});
+    return TableCore.toCsv(state.columns, state.rows);
+  }
+
+  function copyText(text) {
+    return new Promise(function (resolve) {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).then(function () { resolve(true); }, function () { resolve(false); });
+      } else {
+        resolve(false);
+      }
+    });
+  }
+
+  function showTableExport(card, state, kind) {
+    var text = tableExportText(state, kind);
+    var box = $('.tbl-export-box', card);
+    var title = $('.tbl-export-title', card);
+    if (title) {
+      title.textContent = kind === 'latex' ? 'LaTeX · booktabs' : (kind === 'md' ? 'Markdown' : 'CSV');
+    }
+    var preview = $('.tbl-export-preview', card);
+    if (preview) preview.textContent = text;
+    if (box) box.hidden = false;
+    copyText(text).then(function (ok) {
+      toast(ok ? '已复制到剪贴板' : '剪贴板不可用，已显示导出内容');
+    });
+  }
+
+  function renderTable(pane, sec) {
+    var columns = (Array.isArray(sec.columns) ? sec.columns : []).map(function (col) {
+      if (typeof col === 'string') return { key: col, label: col };
+      return col;
+    }).filter(function (col) { return col && col.key; });
+    var rawRows = Array.isArray(sec.rows) ? sec.rows : [];
+    if (!columns.length && rawRows.length && rawRows[0] && typeof rawRows[0] === 'object') {
+      Object.keys(rawRows[0]).forEach(function (key) {
+        if (['id', 'cells', 'details', 'files', 'summary', 'is_baseline', 'emphasis', 'divider_before'].indexOf(key) >= 0) return;
+        columns.push({ key: key, label: key });
+      });
+    }
+    if (!columns.length || !rawRows.length) return '';
+    var rows = TableCore.normalizeRows(rawRows);
+    var baselineId = TableCore.resolveBaselineId(rows, sec.baseline_id);
+    var id = 't' + (++pane.viewer.tableSeq);
+    var state = {
+      columns: columns, rows: rows, groups: Array.isArray(sec.groups) ? sec.groups : [],
+      baselineId: baselineId,
+      showDelta: sec.show_delta === undefined ? !!baselineId : !!sec.show_delta,
+      searchable: sec.searchable === undefined ? rows.length >= 6 : !!sec.searchable,
+      query: '', sortKey: '', sortDir: 'desc',
+      caption: sec.caption || '', note: sec.note || '',
+      rowKeys: {}, decimals: {}, ranks: {}
+    };
+    columns.forEach(function (col) {
+      state.decimals[col.key] = TableCore.inferDecimals(col, rows.map(function (row) {
+        return TableCore.getCell(row, col.key).num;
+      }));
+    });
+    state.ranks = TableCore.rankColumns(columns, rows);
+    rows.forEach(function (row) {
+      var key = tableRowKey(pane, row, columns);
+      if (key) state.rowKeys[row.id] = key;
+    });
+    pane.viewer.tables[id] = state;
+    var html = '<div class="tbl-card" data-tbl-id="' + id + '">' +
+      '<div class="tbl-bar">' +
+      (state.caption ? '<div class="tbl-caption">' + escapeHtml(state.caption) + '</div>' : '') +
+      '<div class="tbl-tools">' +
+      (state.searchable ? '<input type="search" class="tbl-search" placeholder="搜索行" aria-label="搜索表格">' : '') +
+      '<button type="button" class="tbl-btn" data-tact="delta" aria-pressed="' + (state.showDelta ? 'true' : 'false') + '" title="与基准行对比">Δ 基准对比</button>' +
+      '<button type="button" class="tbl-btn" data-tact="latex" title="复制 booktabs LaTeX">LaTeX</button>' +
+      '<button type="button" class="tbl-btn" data-tact="md" title="复制 Markdown 表格">Markdown</button>' +
+      '<button type="button" class="tbl-btn" data-tact="csv" title="复制 CSV">CSV</button>' +
+      '</div></div>' +
+      '<div class="tbl-scroll"><table class="exp-tbl">' + tableHeadHtml(state) +
+      '<tbody>' + tableBodyHtml(state) + '</tbody></table></div>' +
+      (state.note ? '<div class="tbl-note">' + escapeHtml(state.note) + '</div>' : '') +
+      '<div class="tbl-export-box" hidden><div class="tbl-export-head">' +
+      '<span class="tbl-export-title">导出</span>' +
+      '<button type="button" class="tbl-btn tbl-export-close">关闭</button></div>' +
+      '<pre class="tbl-export-preview"></pre></div>' +
+      '</div>';
+    return html;
+  }
+
+  function bindTables(pane) {
+    $$('.tbl-card', pane.canvasRoot).forEach(function (card) {
+      var id = card.getAttribute('data-tbl-id');
+      var state = pane.viewer.tables[id];
+      if (!state) return;
+      var tbody = $('tbody', card);
+      function syncDeltaButton() {
+        var btn = $('[data-tact="delta"]', card);
+        if (btn) btn.setAttribute('aria-pressed', state.showDelta ? 'true' : 'false');
+      }
+      function repaintBody() {
+        if (tbody) tbody.innerHTML = tableBodyHtml(state);
+        syncDeltaButton();
+      }
+      $$('th[data-tcol]', card).forEach(function (th) {
+        th.addEventListener('click', function () {
+          var key = th.getAttribute('data-tcol');
+          if (state.sortKey === key) {
+            state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+          } else {
+            state.sortKey = key;
+            state.sortDir = 'desc';
+          }
+          $$('th[data-tcol]', card).forEach(function (other) {
+            var active = other.getAttribute('data-tcol') === state.sortKey;
+            other.classList.toggle('sorted', active);
+            var mark = $('.tbl-sort', other);
+            if (mark) mark.textContent = active ? (state.sortDir === 'asc' ? '↑' : '↓') : '';
+          });
+          repaintBody();
+        });
+      });
+      var search = $('.tbl-search', card);
+      if (search) {
+        search.addEventListener('input', function () {
+          state.query = search.value;
+          repaintBody();
+        });
+      }
+      $$('[data-tact]', card).forEach(function (btn) {
+        var act = btn.getAttribute('data-tact');
+        if (act === 'delta') {
+          btn.addEventListener('click', function () {
+            state.showDelta = !state.showDelta;
+            repaintBody();
+          });
+        } else if (act === 'latex' || act === 'md' || act === 'csv') {
+          btn.addEventListener('click', function () { showTableExport(card, state, act); });
+        }
+      });
+      var close = $('.tbl-export-close', card);
+      if (close) {
+        close.addEventListener('click', function () {
+          var box = $('.tbl-export-box', card);
+          if (box) box.hidden = true;
+        });
+      }
+      card.addEventListener('click', function (ev) {
+        var target = ev.target && ev.target.closest ? ev.target.closest('.tbl-base-btn') : null;
+        if (!target) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        state.baselineId = target.getAttribute('data-base-row') || '';
+        state.showDelta = !!state.baselineId;
+        repaintBody();
+      });
+      syncDeltaButton();
+    });
+  }
+
+  function chartDrawerKeys(pane, sec, kind, state) {
+    if (kind === 'bar' || kind === 'line') {
+      (Array.isArray(sec.series) ? sec.series : []).forEach(function (series, index) {
+        if (!series) return;
+        var key = series.name === undefined || series.name === null || String(series.name) === ''
+          ? 'S' + (index + 1) : String(series.name);
+        if (!series.details && !series.summary && !(Array.isArray(series.files) && series.files.length)) return;
+        state.seriesKeys[index] = registerDrawer(pane, {
+          kicker: kind === 'line' ? '折线系列' : '柱状系列',
+          title: key,
+          tags: [series.unit].filter(Boolean),
+          summary: series.summary || '',
+          details: series.details || '',
+          files: series.files || []
+        });
+      });
+      return;
+    }
+    if (kind === 'scatter') {
+      (Array.isArray(sec.points) ? sec.points : []).forEach(function (point, index) {
+        if (!point) return;
+        if (!point.details && !point.summary && !(Array.isArray(point.files) && point.files.length)) return;
+        state.pointKeys[index] = registerDrawer(pane, {
+          kicker: '散点详情',
+          title: point.label || ('点 ' + (index + 1)),
+          tags: [point.group, point.highlight ? '重点' : ''].filter(Boolean),
+          summary: point.summary || '',
+          details: point.details || '',
+          files: point.files || []
+        });
+      });
+      return;
+    }
+    if (kind === 'heatmap') {
+      if (Array.isArray(sec.cell_details)) {
+        sec.cell_details.forEach(function (line, rowIdx) {
+          if (!Array.isArray(line)) return;
+          line.forEach(function (cell, colIdx) {
+            if (!cell || typeof cell !== 'object') return;
+            if (!cell.details && !cell.summary && !(Array.isArray(cell.files) && cell.files.length)) return;
+            state.cellKeys[rowIdx + ':' + colIdx] = registerDrawer(pane, {
+              kicker: '热力格详情',
+              title: (cell.label || ((cell.row_label || rowIdx) + ' × ' + (cell.col_label || colIdx))),
+              tags: cell.status ? [cell.status] : [],
+              summary: cell.summary || '',
+              details: cell.details || '',
+              files: cell.files || []
+            });
+          });
+        });
+      }
+      (Array.isArray(sec.cells) ? sec.cells : []).forEach(function (cell, index) {
+        if (!cell) return;
+        if (!cell.details && !cell.summary && !(Array.isArray(cell.files) && cell.files.length)) return;
+        state.sparseKeys[index] = registerDrawer(pane, {
+          kicker: '热力格详情',
+          title: cell.label || ('格 ' + (index + 1)),
+          tags: cell.status ? [cell.status] : [],
+          summary: cell.summary || '',
+          details: cell.details || '',
+          files: cell.files || []
+        });
+      });
+    }
+  }
+
+  function renderChart(pane, sec) {
+    var id = 'c' + (++pane.viewer.chartSeq);
+    var kind = ChartCore.chartKind(sec);
+    if (['bar', 'line', 'scatter', 'heatmap'].indexOf(kind) < 0) kind = 'bar';
+    var state = { sec: sec, kind: kind, hidden: {}, seriesKeys: {}, pointKeys: {}, cellKeys: {}, sparseKeys: {} };
+    chartDrawerKeys(pane, sec, kind, state);
+    pane.viewer.charts[id] = state;
+    return '<div class="chart-card" data-chart-id="' + id + '" data-chart-kind="' + escapeAttr(kind) + '">' +
+      '<div class="chart-stage"><div class="chart-svg-host"></div><div class="chart-tip" hidden></div></div>' +
+      '<div class="chart-legend"></div>' +
+      (sec.note ? '<div class="chart-note">' + escapeHtml(sec.note) + '</div>' : '') +
+      '</div>';
+  }
+
+  function chartSpecFor(state) {
+    var spec = {};
+    Object.keys(state.sec).forEach(function (key) { spec[key] = state.sec[key]; });
+    spec.chart_type = state.kind;
+    spec.hiddenSeries = state.hidden;
+    spec.title = state.sec.chart_title || '';
+    return spec;
+  }
+
+  function chartGridHtml(layout) {
+    var plot = layout.plot;
+    var out = '';
+    (layout.yAxis && layout.yAxis.ticks ? layout.yAxis.ticks : []).forEach(function (tick) {
+      out += '<line class="chart-grid" x1="' + plot.x + '" y1="' + tick.y + '" x2="' +
+        (plot.x + plot.w) + '" y2="' + tick.y + '"></line>';
+      out += '<text class="chart-tick" x="' + (plot.x - 8) + '" y="' + (tick.y + 4) +
+        '" text-anchor="end">' + escapeHtml(tick.label) + '</text>';
+    });
+    if (layout.yAxis && layout.yAxis.label) {
+      var cx = Math.max(12, plot.x - 46);
+      var cy = plot.y + plot.h / 2;
+      out += '<text class="chart-axis-label" x="' + cx + '" y="' + cy +
+        '" text-anchor="middle" transform="rotate(-90 ' + cx + ' ' + cy + ')">' +
+        escapeHtml(layout.yAxis.label) + '</text>';
+    }
+    return out;
+  }
+
+  function chartRefHtml(layout) {
+    var plot = layout.plot;
+    return (layout.refLines || []).map(function (ref) {
+      var out = '<line class="chart-ref" x1="' + plot.x + '" y1="' + ref.y + '" x2="' +
+        (plot.x + plot.w) + '" y2="' + ref.y + '"></line>';
+      if (ref.label) {
+        out += '<text class="chart-ref-label" x="' + (plot.x + plot.w) + '" y="' + (ref.y - 5) +
+          '" text-anchor="end">' + escapeHtml(ref.label) + '</text>';
+      }
+      return out;
+    }).join('');
+  }
+
+  function chartXLabelsHtml(layout) {
+    return (layout.xLabels || []).map(function (label) {
+      return '<text class="chart-tick" x="' + label.x + '" y="' + label.y +
+        '" text-anchor="' + (label.anchor || 'middle') + '">' + escapeHtml(label.text) + '</text>';
+    }).join('');
+  }
+
+  function chartDrawerAttr(state, key) {
+    return key ? ' data-drawer="' + key + '"' : '';
+  }
+
+  function chartSvgHtml(layout, state) {
+    var plot = layout.plot;
+    var out = '<svg class="chart-svg" viewBox="0 0 ' + layout.width + ' ' + layout.height +
+      '" preserveAspectRatio="xMidYMid meet" role="img" aria-label="' +
+      escapeAttr(layout.title || layout.kind) + '">';
+    if (layout.title) {
+      out += '<text class="chart-axis-label" x="' + plot.x + '" y="15">' + escapeHtml(layout.title) + '</text>';
+    }
+    if (layout.kind === 'heatmap') {
+      layout.cells.forEach(function (cell) {
+        var key = '';
+        if (cell.sparseIndex !== null && cell.sparseIndex !== undefined) key = state.sparseKeys[cell.sparseIndex] || '';
+        else key = state.cellKeys[cell.row + ':' + cell.col] || '';
+        out += '<rect class="chart-cell" data-tone="' + escapeAttr(cell.tone) + '" x="' + cell.x +
+          '" y="' + cell.y + '" width="' + cell.w + '" height="' + cell.h + '" rx="2" fill-opacity="' +
+          cell.alpha + '" data-tip="' + escapeAttr(cell.tip) + '"' + chartDrawerAttr(state, key) + '></rect>';
+        if (cell.text) {
+          out += '<text class="chart-cell-text" x="' + (cell.x + cell.w / 2) + '" y="' +
+            (cell.y + cell.h / 2 + 4) + '" text-anchor="middle">' + escapeHtml(cell.text) + '</text>';
+        }
+      });
+      (layout.yLabels || []).forEach(function (label) {
+        out += '<text class="chart-tick" x="' + label.x + '" y="' + label.y +
+          '" text-anchor="' + (label.anchor || 'end') + '">' + escapeHtml(label.text) + '</text>';
+      });
+      out += chartXLabelsHtml(layout);
+      out += '</svg>';
+      return out;
+    }
+    out += chartGridHtml(layout);
+    if (layout.kind === 'scatter') {
+      (layout.xAxis && layout.xAxis.ticks ? layout.xAxis.ticks : []).forEach(function (tick) {
+        out += '<line class="chart-grid" x1="' + tick.x + '" y1="' + plot.y + '" x2="' +
+          tick.x + '" y2="' + (plot.y + plot.h) + '"></line>';
+      });
+      if (layout.xAxis && layout.xAxis.label) {
+        out += '<text class="chart-axis-label" x="' + (plot.x + plot.w / 2) + '" y="' +
+          (layout.height - 8) + '" text-anchor="middle">' + escapeHtml(layout.xAxis.label) + '</text>';
+      }
+    }
+    out += chartRefHtml(layout);
+    if (layout.kind === 'bar') {
+      layout.bars.forEach(function (bar) {
+        var key = state.seriesKeys[bar.seriesIndex] || '';
+        out += '<rect class="chart-bar" x="' + bar.x + '" y="' + bar.y + '" width="' + bar.w +
+          '" height="' + bar.h + '" rx="2" fill="' + escapeAttr(bar.color) + '" data-tip="' +
+          escapeAttr(bar.tip) + '"' + chartDrawerAttr(state, key) + '></rect>';
+      });
+    } else if (layout.kind === 'line') {
+      layout.lines.forEach(function (line) {
+        if (!line.d) return;
+        out += '<path class="chart-line' + (line.dashed ? ' dashed' : '') + '" stroke="' +
+          escapeAttr(line.color) + '" d="' + line.d + '"></path>';
+      });
+      layout.points.forEach(function (point) {
+        var key = state.seriesKeys[point.seriesIndex] || '';
+        out += '<circle class="chart-point" cx="' + point.x + '" cy="' + point.y +
+          '" r="3.2" fill="' + escapeAttr(point.color) + '" data-tip="' +
+          escapeAttr(point.tip) + '"' + chartDrawerAttr(state, key) + '></circle>';
+      });
+    } else if (layout.kind === 'scatter') {
+      if (layout.paretoPath) {
+        out += '<path class="chart-pareto" d="' + layout.paretoPath + '"></path>';
+      }
+      layout.points.forEach(function (point) {
+        var key = state.pointKeys[point.index] || '';
+        out += '<circle class="chart-point" cx="' + point.x + '" cy="' + point.y + '" r="' +
+          point.r + '" fill="' + escapeAttr(point.color) + '" fill-opacity="0.85" data-tip="' +
+          escapeAttr(point.tip) + '"' + chartDrawerAttr(state, key) + '></circle>';
+        if (point.label) {
+          out += '<text class="chart-point-label" x="' + point.labelX + '" y="' + point.labelY +
+            '" text-anchor="' + (point.labelAnchor || 'start') + '">' + escapeHtml(point.label) + '</text>';
+        }
+      });
+    }
+    out += chartXLabelsHtml(layout);
+    out += '</svg>';
+    return out;
+  }
+
+  function chartLegendHtml(layout, state) {
+    if (layout.kind === 'heatmap') {
+      var scale = layout.scale || {};
+      return '<span class="chart-scale-label">' + escapeHtml(scale.mode || 'max_good') + ' · ' +
+        escapeHtml(layout.scaleLabel || '') + '</span>';
+    }
+    return (layout.legend || []).map(function (item) {
+      var key = item.key || item.name || '';
+      var hidden = state.hidden[key] ? 'true' : 'false';
+      return '<button type="button" class="chart-pill" data-series="' + escapeAttr(key) +
+        '" data-hidden="' + hidden + '" aria-pressed="' + (hidden === 'true' ? 'false' : 'true') + '">' +
+        '<i style="background:' + escapeAttr(item.color || 'var(--accent)') + '"></i>' +
+        escapeHtml(item.name || key) + '</button>';
+    }).join('');
+  }
+
+  function paintChart(pane, card) {
+    var id = card.getAttribute('data-chart-id');
+    var state = pane.viewer.charts[id];
+    if (!state) return;
+    var layout = ChartCore.layoutChart(chartSpecFor(state));
+    var host = $('.chart-svg-host', card);
+    if (host) host.innerHTML = chartSvgHtml(layout, state);
+    var legend = $('.chart-legend', card);
+    if (legend) {
+      legend.innerHTML = chartLegendHtml(layout, state);
+      if (layout.kind !== 'heatmap') {
+        $$('.chart-pill', legend).forEach(function (pill) {
+          pill.addEventListener('click', function () {
+            var key = pill.getAttribute('data-series');
+            if (!key) return;
+            if (state.hidden[key]) delete state.hidden[key];
+            else state.hidden[key] = true;
+            paintChart(pane, card);
+          });
+        });
+      }
+    }
+  }
+
+  function bindCharts(pane) {
+    $$('.chart-card', pane.canvasRoot).forEach(function (card) {
+      paintChart(pane, card);
+      var stage = $('.chart-stage', card);
+      var tip = $('.chart-tip', card);
+      if (!stage || !tip) return;
+      stage.addEventListener('mousemove', function (ev) {
+        var target = ev.target && ev.target.closest ? ev.target.closest('[data-tip]') : null;
+        if (!target) { tip.hidden = true; return; }
+        tip.textContent = target.getAttribute('data-tip') || '';
+        tip.hidden = false;
+        var box = stage.getBoundingClientRect();
+        var x = ev.clientX - box.left;
+        var y = ev.clientY - box.top;
+        tip.style.left = Math.round(Math.max(6, Math.min(box.width - 160, x + 14))) + 'px';
+        tip.style.top = Math.round(Math.max(6, y - 34)) + 'px';
+      });
+      stage.addEventListener('mouseleave', function () { tip.hidden = true; });
+    });
+  }
+
+  function renderProse(pane, sec) {
+    var text = '';
+    if (typeof sec.content === 'string') text = sec.content;
+    else if (typeof sec.markdown === 'string') text = sec.markdown;
+    else if (typeof sec.text === 'string') text = sec.text;
+    else if (typeof sec.prose === 'string') text = sec.prose;
+    if (!text.trim()) return '';
+    return '<div class="prose-card markdown-body"' +
+      (sec.tone ? ' data-tone="' + escapeAttr(sec.tone) + '"' : '') + '>' +
+      renderMarkdown(text) + '</div>';
+  }
+
   function renderSection(pane, sec) {
     if (!sec || typeof sec !== 'object') return '';
     var type = sec.type;
@@ -2021,7 +3983,10 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       else if (sec.cards) type = 'bento';
       else if (sec.steps) type = 'steps';
       else if (sec.kpis) type = 'kpis';
+      else if (sec.columns && sec.rows) type = 'table';
+      else if (sec.chart_type || sec.subtype || ((sec.matrix || sec.cells) && sec.x_labels)) type = 'chart';
       else if (sec.items) type = 'comparison';
+      else if (typeof sec.prose === 'string' || typeof sec.markdown === 'string') type = 'prose';
     }
     var body = '';
     if (type === 'kpis') body = renderKpis(sec);
@@ -2029,10 +3994,14 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     else if (type === 'comparison') body = renderComparison(pane, sec);
     else if (type === 'bento') body = renderBento(pane, sec);
     else if (type === 'steps') body = renderSteps(pane, sec);
+    else if (type === 'table') body = renderTable(pane, sec);
+    else if (type === 'chart') body = renderChart(pane, sec);
+    else if (type === 'prose') body = renderProse(pane, sec);
     else return '';
     if (!body) return '';
+    var span = Number(sec.span) === 1 ? 1 : 2;
     var title = sec.title ? '<div class="cv-sec-title">' + escapeHtml(sec.title) + '</div>' : '';
-    return '<section class="cv-section" data-type="' + escapeAttr(type) + '">' + title + body + '</section>';
+    return '<section class="cv-section" data-type="' + escapeAttr(type) + '" data-span="' + span + '">' + title + body + '</section>';
   }
 
   function renderCanvas(pane) {
@@ -2048,6 +4017,10 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }
     pane.viewer.drawer = {};
     pane.viewer.drawerSeq = 0;
+    pane.viewer.tables = {};
+    pane.viewer.tableSeq = 0;
+    pane.viewer.charts = {};
+    pane.viewer.chartSeq = 0;
     var html = '';
     if (data.headline) html += '<h1 class="canvas-headline">' + escapeHtml(data.headline) + '</h1>';
     if (data.badges.length) {
@@ -2057,14 +4030,20 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
         return '<span class="badge" data-tone="' + escapeAttr(tone) + '">' + escapeHtml(text) + '</span>';
       }).join('') + '</div>';
     }
+    html += '<div class="cv-sections">';
     if (!data.sections.length) {
       html += '<div class="cv-section"><div class="empty" style="height:200px">画布为空：请提供 sections / nodes / cards。</div></div>';
     } else {
       data.sections.forEach(function (sec) { html += renderSection(pane, sec); });
     }
+    html += '</div>';
     root.innerHTML = html;
+    wrapTables(root);
+    markExternalLinks(root);
     bindGraphHover(pane);
     bindGraphTools(pane);
+    bindTables(pane);
+    bindCharts(pane);
     requestAnimationFrame(function () { fitGraphs(pane); });
   }
 

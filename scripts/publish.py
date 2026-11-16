@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""把结构化内容发布到 visual-reply 本地预览服务（v4，多会话）。
+"""把结构化内容发布到 visual-reply 本地预览服务（v6，多会话）。
 
 支持三种载荷格式：
-    json  Visual Canvas 交互画布（sections: kpis / graph / comparison / bento / steps）
+    json  Visual Canvas 交互画布（sections: kpis / graph / comparison / bento / steps /
+          table / chart / prose）
     html  HTML Artifact 沙箱（iframe 渲染）
     md    兼容模式（阅读 / 脑图 / 分屏）
 
@@ -51,7 +52,7 @@ DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
 SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
-VERSION = 5
+VERSION = 6
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 
 # 长度提醒阈值：只警告，不阻塞发布
@@ -78,7 +79,12 @@ def detect_format(content: str) -> str:
             data = json.loads(text)
         except ValueError:
             data = None
-        if isinstance(data, dict) and any(k in data for k in ("sections", "nodes", "cards")):
+        if isinstance(data, dict) and (
+            any(k in data for k in ("sections", "nodes", "cards"))
+            or ("columns" in data and "rows" in data)
+            or "chart_type" in data
+            or (("matrix" in data or "cells" in data) and "x_labels" in data)
+        ):
             return "json"
 
     head = text[:64].lower()
@@ -375,7 +381,7 @@ def main(argv=None) -> int:
         if not isinstance(parsed, dict):
             print(json.dumps({
                 "ok": False, "format": "json",
-                "error": "JSON 顶层必须是对象（含 sections / nodes / cards）",
+                "error": "JSON 顶层必须是对象（含 sections / nodes / cards / columns+rows / chart_type）",
             }, ensure_ascii=False))
             return 1
 

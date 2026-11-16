@@ -40,11 +40,11 @@ Visual Reply 强制两级信息密度：**首屏不出现长句**——只有数
 
 | 模式 | `--format` | 效果 |
 | --- | --- | --- |
-| **Visual Canvas** | `json` | 用五类组件声明式搭建页面，可滚动、可点击，不用写一行 CSS |
+| **Visual Canvas** | `json` | 用八类组件声明式搭建页面，可滚动、可点击，不用写一行 CSS |
 | **HTML / SVG Artifact** | `html` | 自己的 HTML 放进 `sandbox="allow-scripts"` 的 iframe 渲染，可切换查看源码 |
 | **Markdown 兼容模式** | `md` | 阅读 / 脑图 / 分屏三视图，支持 Mermaid 图表、标题折叠与表格 |
 
-### 五类画布组件
+### 八类画布组件
 
 | `type` | 视觉形态 | 适用场景 |
 | --- | --- | --- |
@@ -53,6 +53,25 @@ Visual Reply 强制两级信息密度：**首屏不出现长句**——只有数
 | `comparison` | 方案卡 + 1–5 评分条 | 技术选型、方案取舍 |
 | `bento` | Bento 网格，卡片可跨列 | 并列模块 / 能力总览 |
 | `steps` | 横向阶段进度条 | 迁移步骤、执行计划、排查路径 |
+| `table` | 科研表格：分组表头、最优/次优标记、基准 Δ、搜索排序、LaTeX / Markdown / CSV 导出 | 基准测试、消融实验、参数对照 |
+| `chart` | 纯 SVG 柱状 / 折线 / 散点 / 热力，tooltip、图例开关、帕累托前沿 | 趋势、分布、权衡关系、消融矩阵 |
+| `prose` | Markdown 长文卡片，支持表格与外部链接 | 结论、方法、限制说明 |
+
+### 科研画布
+
+表格与图表全部离线绘制：不引入 Chart.js / ECharts / DataTables，不依赖 CDN，也不增加任何
+第三方依赖。桌面端用两列栅格，`"span": 1` 的 section 并排显示；分屏或窗口窄于 960 px 时
+自动回落单列。
+
+- **表格**：点表头排序（缺失值无论升降序都沉底），搜索框只重绘 `tbody`，输入焦点不丢；
+  `设为基准` 就地切换基准行并重算所有 Δ，不打开抽屉，点行本身才进 Inspector。`LaTeX`
+  输出 `booktabs`（`\toprule` / `\midrule` / `\textbf` / `\underline` / `\multicolumn`），
+  `Markdown` 与 `CSV` 按 RFC 4180 转义；剪贴板不可用时，导出内容始终保留在表格下方的预览框。
+- **图表**：图例胶囊可点击隐藏系列；折线在 `null` 处拆成多段 SVG 路径；散点可选
+  `max_y_min_x` / `max_xy` / `min_xy` 帕累托前沿并自动避让标签；热力按 `max_good` /
+  `min_good` / `neutral` 归一化到 0–1 透明度。把 `details` / `files` 挂在系列、散点或热力格上，
+  点击即可进右侧抽屉。
+- **长文**：`prose` 复用 Markdown 渲染，自动包裹表格并把外链标记为 `target="_blank"`。
 
 拓扑图的布局全自动，不需要额外字段：
 
@@ -265,6 +284,10 @@ python3 scripts/server.py --port 18765
 | `status`（step） | `done` `active` `pending` | 进度条配色 |
 | `tone`（card） | `accent` `ok` `warn` `err` | Bento 卡片描边与强调色 |
 | `span`（card） | `1` `2` | 4 列栅格中的列宽 |
+| `span`（section） | `1` `2` | 两列栅格中占 1 列或整行；分屏 / 窄屏回落整行 |
+| `columns[]` | `key` / `label` / `align` / `highlight` / `higher_is_better` / `decimals` / `unit` / `delta_unit` | 表格列定义；`higher_is_better` 决定最优方向与 Δ 色调 |
+| `rows[]` | `id` / `cells` / `is_baseline` / `emphasis` / `divider_before` / `details` / `files` | 单元格可写原始值，或 `{value, display, note, status}` |
+| `chart_type` | `bar` `line` `scatter` `heatmap` | 图表类型，缺省 `bar` |
 | `scores` | `{ "维度": 1..5 }` | 渲染成进度条，不要再写文字形容高低 |
 | `layer` | 从 0 开始的整数 | 缺省时按 edges 拓扑排序自动分层 |
 | `details` | Markdown 字符串 | 右侧抽屉内渲染 |
@@ -273,7 +296,10 @@ python3 scripts/server.py --port 18765
 | `edge.label` | ≤ 10 字 | 胶囊标签，超 14 字触发 `warnings` |
 
 顶层只有一张图时，可以直接写成 `{ "headline": …, "nodes": [...], "edges": [...] }`；
-`cards` 同理。自动识别规则：能解析为对象且含 `sections` / `nodes` / `cards` 即视为 json。
+`cards` / `steps` / `kpis` 同理。表格可把 `columns` 与 `rows` 放顶层，图表可把 `chart_type`
+（或 `matrix` + `x_labels`）放顶层。自动识别规则：能解析为对象且含 `sections` / `nodes` /
+`cards` / `columns`+`rows` / `chart_type` / `matrix`+`x_labels` 即视为 json；只有 `prose`
+字段时需要显式 `--format json`。
 
 ---
 
@@ -349,7 +375,7 @@ python3 scripts/test_visual_reply.py
 ```
 
 端到端测试：在随机空闲端口和临时目录上启动真实服务，结束后全部清理。覆盖三种格式、auto 识别、
-五类组件元数据、前端组件存在性、artifact 接口、混合格式历史排序、路径穿越防护、旧版服务接管、
+八类组件元数据、前端组件存在性、artifact 接口、混合格式历史排序、路径穿越防护、旧版服务接管、
 长度提醒，以及开源卫生扫描。装好 `node` 时，还会用页面里的纯几何核心跑一张六列回环拓扑，
 断言越界、穿模、列间距与标签叠字。
 
@@ -357,6 +383,10 @@ v4 追加：所有会话识别来源与深链回执格式；8 进程并发跨 3 
 seq `1..8`、sidecar 全可解析）；SSE 连接 → 2 秒内实时推送 → `/api/state` 补播 →
 挂着客户端 `SIGTERM` 1.5 秒内退出；会话置顶/重命名与 `/api/sessions/..`、`/artifact/session/..`
 穿越拒绝；以及工作台每个渲染器「只有一份实现」的结构断言。
+
+v6 追加：Node VM 里的 `TableCore`（并列排名、双向 Δ、缺失值沉底、LaTeX 转义、Markdown /
+RFC 4180 CSV）与 `ChartCore`（常规/负数/常量/空区间刻度、柱体边界、null 断线、隐藏系列、
+帕累托前沿、热力归一化），以及完整科研画布的发布 / 回读与 table/chart/prose 简写识别。
 
 不需要联网。
 
