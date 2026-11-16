@@ -1,9 +1,9 @@
 ---
 name: visual-reply
-description: Visual-First 交互画布：把结论、架构、方案对比、执行计划发布为本机可视化网页。JSON 画布（拓扑图 / 对比评分 / Bento / 步骤条 / KPI）、HTML Artifact 沙箱、Markdown 兼容三模式，详情折叠进右侧抽屉；多会话工作台自动识别 Agent 线程，左侧会话栏 + 焦点锁 + 分屏，终端只回传短结论与 http://127.0.0.1:18765 链接。
+description: Visual-First 交互画布：把结论、架构、方案对比、执行计划、实验表格与图表发布为本机可视化网页。JSON 画布（拓扑图 / 对比评分 / Bento / 步骤条 / KPI / 科研表格 / 柱线散点热力 / 长文）、HTML Artifact 沙箱、Markdown 兼容三模式，详情折叠进右侧抽屉；多会话工作台自动识别 Agent 线程，左侧会话栏 + 焦点锁 + 分屏，终端只回传短结论与 http://127.0.0.1:18765 链接。
 ---
 
-# Visual Reply v4
+# Visual Reply v6
 
 把结构化结论发布成本机可视化网页，让用户在浏览器里**看**，而不是在终端里滚动长文。
 
@@ -43,7 +43,7 @@ python "${SKILL_DIR}/scripts/publish.py" --help
 ## Visual-First 输出准则（强制）
 
 1. **优先结构化，不要倾倒文字**
-   - 有结构的内容 → `--format json` 输出视觉画布（`graph` / `comparison` / `bento` / `steps` / `kpis`）
+   - 有结构的内容 → `--format json` 输出视觉画布（`graph` / `comparison` / `bento` / `steps` / `kpis` / `table` / `chart` / `prose`）
    - 需要动效、自定义布局、交互演示 → `--format html` 输出 HTML Artifact
    - **严禁再把几百字纯 Markdown 长文直接丢给 visual-reply**。`--format md` 只用于：用户明确要长文阅读、内容本身就是文档、或需要 Mermaid 时序图。
 
@@ -177,11 +177,11 @@ python3 ${SKILL_DIR}/scripts/publish.py \
       "cards": [
         {
           "title": "Visual Canvas",
-          "metric": "5 种组件",
+          "metric": "8 种组件",
           "tag": "core",
           "tone": "accent",
           "span": 2,
-          "summary": "kpis / graph / comparison / bento / steps",
+          "summary": "kpis / graph / comparison / bento / steps / table / chart / prose",
           "details": "所有组件共享同一个 Inspector 抽屉。"
         }
       ]
@@ -194,10 +194,65 @@ python3 ${SKILL_DIR}/scripts/publish.py \
         { "step": "02", "title": "实现画布", "status": "active", "summary": "布局 + 抽屉", "details": "…" },
         { "step": "03", "title": "回归测试", "status": "pending", "summary": "三种格式" }
       ]
+    },
+    {
+      "type": "table",
+      "title": "实验结果",
+      "span": 1,
+      "caption": "Table 1 · 三次运行均值",
+      "groups": [
+        { "label": "Quality", "cols": ["acc", "f1"] },
+        { "label": "Cost", "cols": ["lat", "mem"] }
+      ],
+      "baseline_id": "base",
+      "columns": [
+        { "key": "model", "label": "Model" },
+        { "key": "acc", "label": "Acc", "unit": "%", "higher_is_better": true, "decimals": 1 },
+        { "key": "lat", "label": "Latency", "unit": "ms", "higher_is_better": false, "decimals": 1 }
+      ],
+      "rows": [
+        { "id": "base", "model": "Baseline", "acc": 70.2, "lat": 92.5, "is_baseline": true },
+        { "id": "ours", "model": "Ours", "acc": 77.6,
+          "cells": { "lat": { "value": 95.1, "note": "三次运行均值" } },
+          "details": "## 复现实验\n\n固定随机种子。" }
+      ]
+    },
+    {
+      "type": "chart",
+      "chart_type": "bar",
+      "title": "质量与成本",
+      "span": 1,
+      "categories": ["Acc", "F1"],
+      "series": [
+        { "name": "Baseline", "data": [70.2, 68.4] },
+        { "name": "Ours", "data": [77.6, 76.1] }
+      ],
+      "y_label": "Score",
+      "unit": "%",
+      "ref_lines": [{ "value": 75, "label": "target" }]
+    },
+    {
+      "type": "chart",
+      "chart_type": "line",
+      "title": "训练曲线",
+      "x": ["1", "2", "3", "4"],
+      "series": [
+        { "name": "Baseline", "data": [52.0, 61.4, 66.8, 69.1] },
+        { "name": "Ours", "data": [55.1, 65.2, 71.4, 75.0] }
+      ]
+    },
+    {
+      "type": "prose",
+      "title": "结论",
+      "content": "## 结论\n\n- **Ours** 在同量级延迟下精度最高。"
     }
   ]
 }
 ```
+
+图表还可写 `scatter`（`points` + `pareto: "max_y_min_x" | "max_xy" | "min_xy"`）与
+`heatmap`（`x_labels` / `y_labels` / `values` 二维数组，或稀疏 `cells`）。所有图表都是
+纯 SVG 离线绘制，不依赖 CDN。
 
 字段约束：
 
@@ -208,6 +263,10 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `status`（step） | `done` `active` `pending` | 进度条配色 |
 | `tone`（card） | `accent` `ok` `warn` `err` | Bento 卡片描边与强调色 |
 | `span`（card） | `1` `2` | Bento 列宽，4 列栅格 |
+| `span`（section） | `1` `2` | 桌面两列栅格中占 1 列或整行；分屏与窄屏自动回落整行 |
+| `columns[]` | `key` / `label` / `align` / `highlight` / `higher_is_better` / `decimals` / `unit` / `delta_unit` | 表格列定义；`higher_is_better` 同时决定最优方向与 Δ 色调 |
+| `rows[]` | `id` / `cells` / `is_baseline` / `emphasis` / `divider_before` / `details` / `files` | 单元格可写原始值，或 `{value, display, note, status}` 对象 |
+| `chart_type` | `bar` `line` `scatter` `heatmap` | 图表类型，缺省 `bar` |
 | `scores` | `{维度: 1..5}` | 渲染为进度条，不用写文字形容高低 |
 | `layer` | 整数，从 0 开始 | 缺省时按 edges 拓扑排序自动分层 |
 | `details` | Markdown 字符串 | 右侧抽屉内渲染，可放代码块与列表 |
@@ -215,7 +274,7 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `node.label` | ≤ 12 字 | 两行自动换行，超出省略 |
 | `edge.label` | ≤ 10 字 | 胶囊标签，超 14 字触发 `warnings` |
 
-顶层若只有一个图，可直接写成 `{ "headline": …, "nodes": [...], "edges": [...] }`；`cards` 同理。自动识别规则：可解析为对象且含 `sections` / `nodes` / `cards` 即视为 json。
+顶层若只有一个图，可直接写成 `{ "headline": …, "nodes": [...], "edges": [...] }`；`cards` / `steps` / `kpis` 同理。表格可把 `columns` 与 `rows` 直接放顶层，图表可把 `chart_type`（或 `matrix` + `x_labels`）放顶层。自动识别规则：可解析为对象且含 `sections` / `nodes` / `cards` / `columns`+`rows` / `chart_type` / `matrix`+`x_labels` 即视为 json；只有 `prose` 字段时需显式 `--format json`。
 
 ### 2. 发布
 
@@ -268,7 +327,7 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 
 | 模式 | 触发 | 交互 |
 | --- | --- | --- |
-| A · Visual Canvas | `format = json` | headline + badges + 5 类组件；顶部 `[视觉画布]` / `[原始数据]` 切换；悬停节点高亮上下游；点击节点/卡片/步骤在右侧抽屉展开 `details` 与 `files`；`Esc` 或 × 关闭 |
+| A · Visual Canvas | `format = json` | headline + badges + 8 类组件（kpis / graph / comparison / bento / steps / table / chart / prose）；顶部 `[视觉画布]` / `[原始数据]` 切换；悬停节点高亮上下游；点击节点/卡片/步骤/表格行/散点/热力格在右侧抽屉展开 `details` 与 `files`；表格支持排序、搜索、基准 Δ 与三种导出，图表支持图例开关与 tooltip；`Esc` 或 × 关闭 |
 | B · HTML Artifact | `format = html` | 全屏 `<iframe sandbox="allow-scripts">` 渲染 `/artifact/latest`；顶部 `[全屏]` / `[源码]` 切换；查看历史时加载 `/artifact/history/<filename>` |
 | C · 兼容阅读 | `format = md` | 阅读 / 脑图 / 分屏三视图，Mermaid 图表、标题折叠、表格 |
 
@@ -283,6 +342,16 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `comparison` | 方案卡 + 评分条 + 红绿标签 | 技术选型、方案取舍 |
 | `bento` | Bento 网格，可跨列 | 并列模块/能力总览 |
 | `steps` | 横向阶段进度条 | 迁移步骤、执行计划、排查路径 |
+| `table` | 科研表格：分组表头、最优/次优标记、基准 Δ、搜索排序、LaTeX/Markdown/CSV 导出 | 基准测试、消融实验、参数对照 |
+| `chart` | 纯 SVG 柱状 / 折线 / 散点 / 热力，悬停 tooltip、图例开关、帕累托前沿 | 趋势、分布、权衡关系、消融矩阵 |
+| `prose` | Markdown 长文卡片，支持表格与外部链接 | 结论、方法、限制说明 |
+
+科研表格与图表交互（全部离线，无第三方图表库）：
+
+- **双列栅格**：桌面按两列排布，`span: 1` 的 section 并排；分屏或窄屏自动回落单列。
+- **表格**：点表头排序（缺失值永远沉底），搜索框只重绘 `tbody` 不丢焦点；`设为基准` 按钮就地切换 Δ 对比行，点行本身才打开抽屉；`LaTeX` 输出 `booktabs` 的 `\toprule / \midrule / \textbf / \underline / \multicolumn`，`Markdown` 与 `CSV` 按 RFC 4180 转义。剪贴板不可用时，导出内容始终显示在表格下方的预览框里。
+- **图表**：柱状/折线图例可点击隐藏系列，折线在 `null` 处自动断线；散点可选 `pareto` 前沿并显示标签；热力按 `scale_mode`（`max_good` / `min_good` / `neutral`）着色。`details` / `files` 挂在系列、散点或热力格上即可点击进抽屉。
+- **长文**：`prose` 直接复用 Markdown 渲染与表格包裹逻辑，链接自动 `target="_blank"`。
 
 拓扑图渲染规则（自动生效，无需额外字段）：
 
@@ -315,7 +384,7 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 ~/.cache/agent-visual-reply/
 ├── .publish.lock                     # 写锁：跨平台排他锁（POSIX flock / Windows msvcrt）
 ├── .server.lock                      # 启动锁：冷启动时串行化 server.py 拉起
-├── state.json                        # {version: 4, seq, latest_session_id, latest_reply_id}
+├── state.json                        # {version: 6, seq, latest_session_id, latest_reply_id}
 ├── sessions/
 │   └── <sid>/
 │       ├── session.json              # label / client / project / pinned / seq / reply_count
@@ -366,7 +435,7 @@ python3 ${SKILL_DIR}/scripts/server.py --port 18765
 - **端口被其他程序占用**：`publish.py` 返回 `ok: false`、退出码 2，换 `--port` 重试。
 - **旧版服务没被接管**：健康检查若缺少 `pid` 会拒绝自动接管，手动结束该进程后重试。
 - **服务起不来**：查看 `~/.cache/agent-visual-reply/server.log`，报错信息里也会附带日志末尾。
-- **画布空白**：确认 JSON 顶层是对象且含 `sections` / `nodes` / `cards`；`json.loads` 失败的载荷会回落到 md 渲染。
+- **画布空白**：确认 JSON 顶层是对象且含 `sections` / `nodes` / `cards` / `columns`+`rows` / `chart_type`；`json.loads` 失败的载荷会回落到 md 渲染。
 - **节点分层不理想**：显式给 `layer`，不要让拓扑自动分层在有环图上推断。
 - **宽图右侧看不全**：点拓扑图右上角「适应」按容器宽度缩放（最低 0.35）；`100%` 恢复原始尺寸，`−` / `+` 微调。
 - **图表/脑图不显示**：页面通过 jsdelivr CDN 加载 `marked`、`mermaid`、`markmap`，离线时退化为纯文本；JSON 画布不依赖 CDN（Markdown 抽屉除外）。
@@ -383,4 +452,4 @@ python3 ${SKILL_DIR}/scripts/server.py --port 18765
 python3 ${SKILL_DIR}/scripts/test_visual_reply.py
 ```
 
-覆盖：md/json/html 发布、auto 识别、五种画布组件元数据、前端组件存在性、artifact 接口、混合历史排序、路径穿越防护、旧版服务接管升级，6 列回环拓扑的几何断言（用本机 `node` 跑 `PAGE_HTML` 里的纯几何核心，校验越界、穿模、列间距、标签叠字）；v4 追加多会话自动检测与深链回执、8 进程并发写入（seq 单调、零丢回复、sidecar 全可解析）、SSE 实时推送 / 增量补播 / 挂连接 SIGTERM 1.5s 内退出、会话置顶重命名与路径穿越、以及工作台前端标记与「渲染逻辑只有一份」的结构断言。没有 `node` 时会跳过几何用例并明确报出。另含开源卫生检查：公开文件不得出现本机主目录、私人项目名或作者 handle（README/LICENSE 的安装与署名除外），并校验文档互链、`.gitignore` 与 CI 配置。
+覆盖：md/json/html 发布、auto 识别、八类画布组件元数据、前端组件存在性、artifact 接口、混合历史排序、路径穿越防护、旧版服务接管升级，6 列回环拓扑的几何断言（用本机 `node` 跑 `PAGE_HTML` 里的纯几何核心，校验越界、穿模、列间距、标签叠字）；v4 追加多会话自动检测与深链回执、8 进程并发写入（seq 单调、零丢回复、sidecar 全可解析）、SSE 实时推送 / 增量补播 / 挂连接 SIGTERM 1.5s 内退出、会话置顶重命名与路径穿越、表格/图表纯核心（Node VM：排名、Δ 方向、缺失值沉底、LaTeX 转义、niceScale、断线分段、帕累托前沿、热力归一化）、v6 科研画布端到端发布与 table/chart/prose 简写识别，以及工作台前端标记与「渲染逻辑只有一份」的结构断言。没有 `node` 时会跳过几何与核心用例并明确报出。另含开源卫生检查：公开文件不得出现本机主目录、私人项目名或作者 handle（README/LICENSE 的安装与署名除外），并校验文档互链、`.gitignore` 与 CI 配置。

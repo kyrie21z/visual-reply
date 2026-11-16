@@ -50,11 +50,11 @@ the product; the renderer is just how it is delivered.
 
 | Mode | Format | What you get |
 | --- | --- | --- |
-| **Visual Canvas** | `json` | Declarative page built from five component types. Scrollable, clickable, no CSS required. |
+| **Visual Canvas** | `json` | Declarative page built from eight component types. Scrollable, clickable, no CSS required. |
 | **HTML / SVG Artifact** | `html` | Your own markup rendered inside a sandboxed `allow-scripts` iframe, with a source view toggle. |
 | **Markdown** | `md` | Reading / mind-map / split views with Mermaid diagrams, heading folding and tables. |
 
-### Five canvas components
+### Eight canvas components
 
 | `type` | Shape | Use it for |
 | --- | --- | --- |
@@ -63,6 +63,29 @@ the product; the renderer is just how it is delivered.
 | `comparison` | Option cards with 1–5 score bars | Technology selection, trade-off reviews |
 | `bento` | Bento grid with spanning cards | Parallel modules or capability overview |
 | `steps` | Horizontal stage progress bar | Migrations, execution plans, debugging paths |
+| `table` | Scientific table with grouped headers, best/second marks, baseline Δ, search, sort and LaTeX / Markdown / CSV export | Benchmarks, ablations, parameter grids |
+| `chart` | Offline SVG bar / line / scatter / heatmap with tooltips, legend toggles and Pareto frontiers | Trends, distributions, trade-offs, ablation matrices |
+| `prose` | Markdown card with tables and external links | Conclusions, method notes, limitations |
+
+### Scientific canvas
+
+Tables and charts are rendered entirely offline — no Chart.js, ECharts or DataTables,
+no CDN, no extra dependency. On desktop the canvas uses a two-column grid; sections with
+`"span": 1` sit side by side and collapse to one column in split view or below 960 px.
+
+- **Table** — click a header to sort (missing values always sink to the bottom); the
+  search box filters rows while keeping focus. `设为基准` switches the baseline row in
+  place and recomputes every Δ badge without opening the drawer; clicking the row itself
+  opens the Inspector. `LaTeX` emits a `booktabs` table (`\toprule`, `\midrule`,
+  `\textbf`, `\underline`, `\multicolumn`), `Markdown` and `CSV` escape per RFC 4180.
+  If the clipboard API is unavailable, the export always remains visible in a preview
+  box under the table.
+- **Chart** — legend pills toggle series; lines split into separate SVG path segments at
+  `null` gaps; scatter plots can mark a Pareto frontier (`max_y_min_x`, `max_xy`,
+  `min_xy`) with non-colliding labels; heatmaps normalize into a 0–1 intensity range
+  with `max_good`, `min_good` or `neutral` scaling.
+- **Prose** — reuses the Markdown renderer, including table wrapping and external-link
+  hardening.
 
 The topology renderer handles layout automatically:
 
@@ -298,10 +321,17 @@ Everything except `type` is optional.
 | `files` | array of strings | Monospace chips in the drawer |
 | `node.label` | ≤ 12 chars | Two-line clamp, then ellipsis |
 | `edge.label` | ≤ 10 chars | Capsule label; over 14 chars raises a warning |
+| `span` (section) | `1` `2` | Two-column grid: one column or full width |
+| `columns[]` | `key`, `label`, `align`, `highlight`, `higher_is_better`, `decimals`, `unit`, `delta_unit` | Table column spec; `higher_is_better` drives best/second marks and Δ tone |
+| `rows[]` | `id`, `cells`, `is_baseline`, `emphasis`, `divider_before`, `details`, `files` | A cell is a primitive or `{value, display, note, status}` |
+| `chart_type` | `bar` `line` `scatter` `heatmap` | Defaults to `bar` |
 
 A top-level `{ "headline": …, "nodes": [...], "edges": [...] }` is accepted as a
-shortcut for a single graph; the same applies to `cards`. A payload is auto-detected as
-JSON when it parses as an object containing `sections`, `nodes` or `cards`.
+shortcut for a single graph; the same applies to `cards`. A table can put `columns` and
+`rows` at the top level, and a chart can put `chart_type` (or `matrix` + `x_labels`) at
+the top level. A payload is auto-detected as JSON when it parses as an object containing
+`sections`, `nodes`, `cards`, `columns`+`rows`, `chart_type`, or `matrix`+`x_labels`;
+a prose-only payload needs an explicit `--format json`.
 
 ---
 
@@ -391,6 +421,13 @@ replies, seq `1..8`, every sidecar valid JSON); SSE connect → live push under 
 `/api/state` catch-up → `SIGTERM` under 1.5 s with a client still attached; session
 pin/rename plus traversal rejection on `/api/sessions/..` and `/artifact/session/..`;
 and structural assertions that the workbench keeps exactly one copy of each renderer.
+
+v6 adds: `TableCore` in a Node VM (tie-aware ranking, Δ direction for both
+higher/lower-is-better columns, missing values sinking on every sort direction, LaTeX
+`booktabs` escaping, Markdown and RFC 4180 CSV) and `ChartCore` (nice scales for normal,
+negative, constant and empty ranges, bar bounds, line path splitting across `null` gaps,
+hidden-series toggles, Pareto frontiers, normalized heatmaps), plus a full scientific
+canvas publish/read-back round trip and shorthand table/chart/prose detection.
 
 No network access is required.
 

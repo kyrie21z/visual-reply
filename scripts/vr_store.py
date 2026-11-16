@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""visual-reply v4 共享存储层（纯标准库）。
+"""visual-reply v6 共享存储层（纯标准库）。
 
 职责：
     1. 跨平台进程锁：`<cache>/.publish.lock`
@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-STORE_VERSION = 5
+STORE_VERSION = 6
 
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 EXT_FORMAT = {".json": "json", ".html": "html", ".md": "md"}
