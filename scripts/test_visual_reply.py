@@ -931,6 +931,7 @@ httpd.serve_forever()
 
 SESSION_ENV_KEYS = (
     "VISUAL_REPLY_SESSION",
+    "VISUAL_REPLY_PUBLIC_URL",
     "ANTIGRAVITY_CONVERSATION_ID",
     "ANTIGRAVITY_PROJECT_ID",
     "ANTIGRAVITY_AGENT",
@@ -3096,6 +3097,88 @@ def main() -> int:
 
         status, _, _ = raw_request(port, "GET", "/artifact/board/ci-live")
         check("面板切回 json 后 artifact 恢复 404", status == 404, str(status))
+
+        # ---------- 17d. 公开地址（public_url）回执 ----------
+        print("\n[17d] 公开地址回执与配置优先级")
+        config_path = cache / "config.json"
+        if config_path.exists():
+            config_path.unlink()
+
+        code, baseline = publish(port, cache, MD, "公开地址基线")
+        check("未配置公开地址时回执退回本地深链",
+              code == 0 and baseline.get("url") == baseline.get("local_url")
+              and str(baseline.get("url", "")).startswith("http://127.0.0.1:")
+              and baseline.get("public_url") is None
+              and baseline.get("public_base_url") is None
+              and baseline.get("base_url") == baseline.get("local_base_url"),
+              str(baseline)[:400])
+
+        config_path.write_text(json.dumps({"public_url": "https://vr.example.com/"}),
+                               encoding="utf-8")
+        code, configured = publish(
+            port, cache, MD, "公开地址配置",
+            env=clean_env(ANTIGRAVITY_CONVERSATION_ID="public-url-config"))
+        sid = configured.get("session_id")
+        full_query = urllib.parse.urlencode({"session": sid, "reply": configured.get("reply_id")})
+        session_query = urllib.parse.urlencode({"session": sid})
+        check("config.json 的 public_url 生效并去掉末尾斜杠",
+              code == 0
+              and configured.get("public_base_url") == "https://vr.example.com"
+              and configured.get("base_url") == "https://vr.example.com"
+              and configured.get("url") == f"https://vr.example.com/?{full_query}"
+              and configured.get("session_url") == f"https://vr.example.com/?{session_query}",
+              str(configured)[:400])
+        check("公开地址生效时 local_url 仍指向本机",
+              configured.get("local_url") == f"http://127.0.0.1:{port}/?{full_query}"
+              and configured.get("local_session_url")
+              == f"http://127.0.0.1:{port}/?{session_query}"
+              and str(configured.get("local_url", "")).startswith("http://127.0.0.1:"),
+              str(configured.get("local_url")))
+
+        code, env_reply = publish(
+            port, cache, MD, "公开地址环境变量",
+            env=clean_env(VISUAL_REPLY_PUBLIC_URL="https://vr-env.example.com"))
+        check("VISUAL_REPLY_PUBLIC_URL 覆盖 config.json",
+              code == 0 and env_reply.get("public_base_url") == "https://vr-env.example.com"
+              and str(env_reply.get("url", "")).startswith("https://vr-env.example.com/?session="),
+              str(env_reply)[:400])
+
+        code, env_board = publish(
+            port, cache, board_one_text, "公开地址面板",
+            extra=["--board", "public-board", "--project", "release"],
+            env=clean_env(VISUAL_REPLY_PUBLIC_URL="https://vr-env.example.com"))
+        check("面板回执同样使用公开地址",
+              code == 0
+              and env_board.get("url") == "https://vr-env.example.com/?board=public-board"
+              and env_board.get("public_url")
+              == "https://vr-env.example.com/?board=public-board"
+              and env_board.get("public_base_url") == "https://vr-env.example.com"
+              and str(env_board.get("local_url", "")).startswith("http://127.0.0.1:")
+              and str(env_board.get("local_url", "")).endswith("/?board=public-board"),
+              str(env_board)[:400])
+
+        code, cli_receipt = publish(
+            port, cache, MD, "公开地址命令行",
+            extra=["--public-url", "https://vr-cli.example.com"],
+            env=clean_env(VISUAL_REPLY_PUBLIC_URL="https://vr-env.example.com"))
+        check("--public-url 覆盖 VISUAL_REPLY_PUBLIC_URL",
+              code == 0 and cli_receipt.get("public_base_url") == "https://vr-cli.example.com"
+              and str(cli_receipt.get("url", "")).startswith("https://vr-cli.example.com/?session="),
+              str(cli_receipt)[:400])
+
+        code, bad = publish(
+            port, cache, MD, "公开地址非法",
+            extra=["--public-url", "ftp://bad.example"])
+        check("非法 --public-url 安全回退本地深链",
+              code == 0 and bad.get("public_url") is None
+              and bad.get("public_base_url") is None
+              and bad.get("url") == bad.get("local_url")
+              and str(bad.get("url", "")).startswith("http://127.0.0.1:"),
+              str(bad)[:400])
+
+        if config_path.exists():
+            config_path.unlink()
+        check("公开地址测试配置已清理", not config_path.exists(), str(config_path))
 
     finally:
         print("\n[18] 清理")

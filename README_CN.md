@@ -366,6 +366,7 @@ python3 scripts/server.py --port 18765
 | `--no-browser` | 不自动打开浏览器 |
 | `--port` | 服务端口，默认 `18765` |
 | `--cache-dir` | 缓存目录，默认 `~/.cache/agent-visual-reply` |
+| `--public-url` | 回执使用的公开 HTTPS 基地址（如 `https://vr.example.com`）；缺省依次读 `VISUAL_REPLY_PUBLIC_URL` 与 `<cache-dir>/config.json` |
 | `--session` | 会话 ID，显式指定后跳过自动检测；非法 ID 直接拒绝 |
 | `--session-name` | 会话显示名，持久化到 `session.json` |
 | `--agent` | 客户端徽标（`codex` / `claude` / `antigravity` …） |
@@ -375,6 +376,15 @@ python3 scripts/server.py --port 18765
 | `--ttl` | 新鲜度窗口（秒）；`0`（默认）表示静态面板 / 不过期 |
 | `--board-status` | 可选状态提示：`ok` / `warn` / `err` / `complete` |
 | `--open-browser` | 面板模式下也强制打开浏览器（回复模式本来就会打开） |
+
+### 公开地址
+
+页面经隧道或反向代理暴露到公网时，给 `publish.py` 设置一次公开基地址即可：`--public-url https://vr.example.com`、
+环境变量 `VISUAL_REPLY_PUBLIC_URL`，或 `<cache-dir>/config.json` 里的
+`{"public_url": "https://vr.example.com"}`（越靠前优先级越高）。取值必须是带主机名的 `http` / `https`；
+query、fragment 与末尾斜杠会被丢弃，非法值安全回退为本地链接。生效后回执的 `url` / `base_url` /
+`session_url` 使用公开深链，并额外给出本机等价的 `local_url` / `local_base_url` / `local_session_url`
+与 `public_url` / `public_base_url`（未配置时为 `null`）；浏览器始终只打开本地地址。
 
 缓存结构：
 

@@ -408,6 +408,7 @@ a prose-only payload needs an explicit `--format json`.
 | `--no-browser` | Do not open a browser |
 | `--port` | Server port, default `18765` |
 | `--cache-dir` | Cache directory, default `~/.cache/agent-visual-reply` |
+| `--public-url` | Public HTTPS base URL for receipts (e.g. `https://vr.example.com`); falls back to `VISUAL_REPLY_PUBLIC_URL`, then `<cache-dir>/config.json` |
 | `--session` | Session id; skips auto-detection, rejected if unsafe |
 | `--session-name` | Human-readable session label, persisted in `session.json` |
 | `--agent` | Client badge (`codex`, `claude`, `antigravity`, …) |
@@ -417,6 +418,18 @@ a prose-only payload needs an explicit `--format json`.
 | `--ttl` | Freshness window in seconds; `0` (default) means a static board |
 | `--board-status` | Optional status hint: `ok` / `warn` / `err` / `complete` |
 | `--open-browser` | Force the browser open in board mode (reply mode already does) |
+
+### Public URLs
+
+When the page is exposed through a tunnel or reverse proxy, tell `publish.py` the public
+base once — `--public-url https://vr.example.com`, the `VISUAL_REPLY_PUBLIC_URL`
+environment variable, or `{"public_url": "https://vr.example.com"}` in
+`<cache-dir>/config.json` (earlier sources win). The value must be `http` / `https` with a
+host; query, fragment and trailing slashes are dropped, and an invalid value safely falls
+back to local links. Receipts then use the public deep link in `url` / `base_url` /
+`session_url`, expose the local equivalents as `local_url` / `local_base_url` /
+`local_session_url`, and report `public_url` / `public_base_url` (`null` when unset).
+The browser is always opened against the local address.
 
 Cache layout:
 
