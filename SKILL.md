@@ -399,6 +399,8 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 
 **不要截断或改写查询参数**：`?session=` 决定打开哪个会话、`?reply=` 定位到哪一轮回复，删掉后用户会落到默认页面、看不到刚发布的内容。只有回执无法解析（脚本异常、非 JSON 输出）时才退化为基地址 `http://127.0.0.1:18765`。
 
+配置了公开地址（`--public-url` / `VISUAL_REPLY_PUBLIC_URL` / `<cache-dir>/config.json`）时，回执的 `url` 换成公开深链、查询参数不变，同时给出本机等价的 `local_url` 与公开深链 `public_url`（未配置时为 `null`，面板回执同理）；打印给用户仍只用 `url`。
+
 不要把发布过的正文再贴一遍，用户已经在浏览器里看到了。JSON 里的路径、字符数等细节无需复述，除非发布失败。
 
 ---
@@ -454,6 +456,7 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `--no-browser` | 不自动打开浏览器 |
 | `--port` | 服务端口，默认 `18765` |
 | `--cache-dir` | 缓存目录，默认 `~/.cache/agent-visual-reply` |
+| `--public-url` | 回执使用的公开 HTTPS 基地址（如 `https://vr.example.com`）；缺省读 `VISUAL_REPLY_PUBLIC_URL`，再读 `<cache-dir>/config.json` |
 | `--session` | 会话 ID（默认自动检测，优先级最高） |
 | `--session-name` | 会话显示名，持久化到 `session.json` |
 | `--agent` | 客户端徽标，如 `codex` / `claude` / `antigravity` |
@@ -463,6 +466,13 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `--ttl` | 新鲜度窗口（秒）；`0` 或不传表示静态面板 / 不过期 |
 | `--board-status` | 面板状态提示：`ok` / `warn` / `err` / `complete` |
 | `--open-browser` | 面板模式下也强制打开浏览器（回复模式本来就会自动打开） |
+
+公开地址（可选）：页面经隧道或反向代理暴露到公网时，回执里的链接需要换成用户可访问的地址。
+优先级：`--public-url` > 环境变量 `VISUAL_REPLY_PUBLIC_URL` > `<cache-dir>/config.json` 的
+`{"public_url": "https://vr.example.com"}`。取值只保留 scheme + host + path（仅 `http` / `https`），
+丢弃 query、fragment 与末尾斜杠；非法值安全回退为本地地址。生效后回执的 `url` / `base_url` /
+`session_url` 使用公开地址，并额外带 `local_url`（本机等价深链）与 `public_url`（公开深链，未配置时为
+`null`）；浏览器始终只打开本地地址。
 
 缓存结构：
 

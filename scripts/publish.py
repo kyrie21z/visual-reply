@@ -179,6 +179,30 @@ def read_content(args: argparse.Namespace) -> str:
     }, ensure_ascii=False))
 
 
+def resolve_public_url(cli_value: str, cache_dir: Path) -> str:
+    """解析回执使用的公开基地址，优先级：CLI > 环境变量 > config.json。"""
+    candidates = [cli_value, os.environ.get("VISUAL_REPLY_PUBLIC_URL", "")]
+    try:
+        config = json.loads((cache_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        config = None
+    if isinstance(config, dict) and isinstance(config.get("public_url"), str):
+        candidates.append(config["public_url"])
+
+    for candidate in candidates:
+        text = candidate.strip()
+        if not text:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(text)
+        except ValueError:
+            return ""
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme.lower()}://{parsed.netloc}{parsed.path.rstrip('/')}"
+    return ""
+
+
 def http_json(url: str, timeout: float = 1.5):
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -338,6 +362,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help=f"服务端口（默认 {DEFAULT_PORT}）")
     parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR),
                         help=f"缓存目录（默认 {DEFAULT_CACHE_DIR}）")
+    parser.add_argument("--public-url", default="",
+                        help="回执中的公开 HTTPS 基地址（如 https://vr.example.com）；"
+                             "缺省依次读取 VISUAL_REPLY_PUBLIC_URL 与 <cache-dir>/config.json")
     parser.add_argument("--session", default="",
                         help="会话 ID（默认自动检测：环境变量 / 终端复用器 / 父进程）")
     parser.add_argument("--session-name", default="", help="会话显示名（会持久化到 session.json）")
@@ -366,6 +393,9 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cache_dir = Path(args.cache_dir).expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    local_base = f"http://127.0.0.1:{args.port}"
+    public_base = resolve_public_url(args.public_url, cache_dir)
+    active_base = public_base or local_base
     board_mode = bool((args.board or "").strip())
     if not board_mode:
         (cache_dir / "history").mkdir(parents=True, exist_ok=True)
@@ -558,14 +588,15 @@ def main(argv=None) -> int:
         })
 
     # 4. 深链：首次拉起服务时直接打开对应会话与回复（面板模式默认不弹浏览器）
-    base_url = f"http://127.0.0.1:{args.port}"
+    #    回执优先使用公开地址；浏览器始终打开本地地址。
     browser = None
 
     if board_mode:
         board_query = urllib.parse.quote(board_id)
-        url = f"{base_url}/?board={board_query}"
+        local_url = f"{local_base}/?board={board_query}"
+        url = f"{active_base}/?board={board_query}"
         if args.open_browser and not args.no_browser:
-            browser = open_browser(url)
+            browser = open_browser(local_url)
         result = {
             "ok": True,
             "version": VERSION,
@@ -573,7 +604,11 @@ def main(argv=None) -> int:
             "format": fmt,
             "title": title,
             "url": url,
-            "base_url": base_url,
+            "base_url": active_base,
+            "local_url": local_url,
+            "local_base_url": local_base,
+            "public_url": f"{public_base}/?board={board_query}" if public_base else None,
+            "public_base_url": public_base or None,
             "board_id": board_id,
             "board_name": receipt["board"]["label"],
             "project": receipt["board"]["project"],
@@ -594,18 +629,25 @@ def main(argv=None) -> int:
     else:
         query = urllib.parse.urlencode({"session": session_id, "reply": reply_id})
         session_query = urllib.parse.urlencode({"session": session_id})
-        url = f"{base_url}/?{query}"
-        session_url = f"{base_url}/?{session_query}"
+        local_url = f"{local_base}/?{query}"
+        local_session_url = f"{local_base}/?{session_query}"
+        url = f"{active_base}/?{query}"
+        session_url = f"{active_base}/?{session_query}"
         if started and not args.no_browser:
-            browser = open_browser(url)
+            browser = open_browser(local_url)
         result = {
             "ok": True,
             "version": VERSION,
             "format": fmt,
             "title": title,
             "url": url,
-            "base_url": base_url,
+            "base_url": active_base,
             "session_url": session_url,
+            "local_url": local_url,
+            "local_base_url": local_base,
+            "local_session_url": local_session_url,
+            "public_url": f"{public_base}/?{query}" if public_base else None,
+            "public_base_url": public_base or None,
             "session_id": session_id,
             "session_name": receipt["session"]["label"],
             "reply_id": reply_id,
