@@ -576,11 +576,11 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 /* ---------- v4 Workbench：会话栏 / 分屏 / 阅读守卫 ---------- */
 #shell { flex: 1 1 auto; display: flex; min-height: 0; min-width: 0; }
 #session-rail {
-  flex: 0 0 296px; display: flex; flex-direction: column; min-height: 0;
+  flex: 0 0 296px; display: flex; flex-direction: column; min-height: 0; min-width: 0;
   background: var(--bg-elev); border-right: 1px solid var(--border);
   transition: flex-basis .18s ease;
 }
-#session-rail[data-open="false"] { flex-basis: 0; overflow: hidden; border-right: 0; }
+#session-rail[data-open="false"] { flex-basis: 0; min-width: 0; overflow: hidden; border-right: 0; pointer-events: none; }
 .rail-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 9px 10px 9px 12px; border-bottom: 1px solid var(--border);
@@ -589,6 +589,15 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 .rail-tabs { display: flex; gap: 2px; padding: 2px; background: var(--bg-soft); border: 1px solid var(--border-strong); border-radius: 9px; }
 .rail-tabs button { border: 0; background: transparent; color: var(--fg-muted); padding: 3px 7px; font-size: 11px; border-radius: 7px; }
 .rail-tabs button[data-active="true"] { background: var(--bg-elev); color: var(--fg); box-shadow: 0 1px 3px rgba(0, 0, 0, .14); }
+.rail-head-end { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.rail-close {
+  flex: 0 0 auto; width: 26px; height: 26px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 7px; color: var(--fg-muted); background: var(--bg-soft);
+}
+.rail-close:hover { color: var(--fg); border-color: var(--accent); background: var(--accent-soft); }
+#rail-toggle[data-active="true"] { border-color: color-mix(in srgb, var(--accent) 42%, var(--border-strong)); color: var(--fg); }
+#rail-toggle[data-active="false"] { color: var(--fg-muted); }
 .rail-list { flex: 1 1 auto; overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
 .rail-empty { padding: 26px 12px; text-align: center; font-size: 12px; color: var(--fg-muted); line-height: 1.6; }
 .rail-card {
@@ -795,7 +804,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     <div id="doc-sub" class="doc-sub"></div>
   </div>
   <div class="spacer"></div>
-  <button type="button" id="rail-toggle" title="显示 / 隐藏会话栏">会话</button>
+  <button type="button" id="rail-toggle" aria-controls="session-rail" aria-expanded="true" aria-keyshortcuts="Control+B" data-active="true" title="显示 / 隐藏会话栏 (Ctrl+B)">会话</button>
   <button type="button" id="mode-btn" title="锁定当前会话，或跟随全局最新">跟随全局</button>
   <div class="seg" id="view-switch" role="group" aria-label="视图切换">
     <button type="button" data-view="reading">阅读</button>
@@ -817,10 +826,18 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   <aside id="session-rail" data-open="true" aria-label="会话列表">
     <div class="rail-head">
       <span class="rail-title" id="rail-title">会话</span>
-      <div class="rail-tabs" id="rail-tabs" role="group" aria-label="会话筛选">
-        <button type="button" data-filter="all" data-active="true">全部</button>
-        <button type="button" data-filter="unread">未读</button>
-        <button type="button" data-filter="pinned">置顶</button>
+      <div class="rail-head-end">
+        <div class="rail-tabs" id="rail-tabs" role="group" aria-label="会话筛选">
+          <button type="button" data-filter="all" data-active="true">全部</button>
+          <button type="button" data-filter="unread">未读</button>
+          <button type="button" data-filter="pinned">置顶</button>
+        </div>
+        <button type="button" id="rail-close" class="rail-close" aria-label="关闭会话栏" aria-controls="session-rail" aria-keyshortcuts="Control+B" title="关闭会话栏 (Ctrl+B)">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="2.5" width="12" height="11" rx="2"></rect>
+            <path d="M6 2.5v11M10.5 6.25L8.5 8l2 1.75"></path>
+          </svg>
+        </button>
       </div>
     </div>
     <div class="rail-list" id="rail-list" role="tree" aria-label="项目 · 会话 · 回复"></div>
@@ -3392,6 +3409,38 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       };
     }
 
+    /* 输入控件内不劫持快捷键：尊重正在输入的用户。 */
+    function isEditableEventTarget(target) {
+      if (!target || typeof target !== 'object') return false;
+      if (target.isContentEditable) return true;
+      var tag = String(target.tagName || '').toUpperCase();
+      if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+      if (tag === 'INPUT') {
+        var type = String(target.type || 'text').toLowerCase();
+        return type !== 'button' && type !== 'submit' && type !== 'reset' &&
+          type !== 'checkbox' && type !== 'radio';
+      }
+      if (typeof target.closest === 'function') {
+        var ce = target.closest('[contenteditable=""], [contenteditable="true"]');
+        if (ce) return true;
+      }
+      return false;
+    }
+
+    /* Ctrl+B / Cmd+B（不含 Shift / Alt，二者不可同时按下）。 */
+    function isRailShortcut(ev) {
+      if (!ev || ev.defaultPrevented || ev.repeat || ev.isComposing || ev.keyCode === 229) {
+        return false;
+      }
+      if (ev.altKey || ev.shiftKey) return false;
+      if (Boolean(ev.ctrlKey) === Boolean(ev.metaKey)) return false;
+      var key = String(ev.key || '').toLowerCase();
+      var code = String(ev.code || '');
+      if (key !== 'b' && code !== 'KeyB') return false;
+      if (isEditableEventTarget(ev.target)) return false;
+      return true;
+    }
+
     return {
       parseCreatedMs: parseCreatedMs,
       compareSessionsFixed: compareSessionsFixed,
@@ -3399,7 +3448,8 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       buildRailTree: buildRailTree,
       sortRepliesDesc: sortRepliesDesc,
       computeBoardHealth: computeBoardHealth,
-      formatAgeShort: formatAgeShort
+      formatAgeShort: formatAgeShort,
+      isRailShortcut: isRailShortcut
     };
   })();
   (typeof globalThis !== 'undefined' ? globalThis : this).RailTreeCore = RailTreeCore;
@@ -4949,12 +4999,36 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }, 210);
   }
 
+  /* 统一出口：DOM 状态、aria-expanded 与焦点回收都在这里维护。 */
+  function setRailOpen(open, persist) {
+    var next = Boolean(open);
+    var rail = $('#session-rail');
+    var toggleBtn = $('#rail-toggle');
+    if (!next && rail && document.activeElement && rail.contains(document.activeElement)) {
+      if (toggleBtn && typeof toggleBtn.focus === 'function') toggleBtn.focus();
+    }
+    if (rail) {
+      rail.dataset.open = String(next);
+      rail.inert = !next;
+    }
+    if (toggleBtn) {
+      toggleBtn.setAttribute('aria-expanded', String(next));
+      toggleBtn.dataset.active = String(next);
+    }
+    if (persist !== false) {
+      try { localStorage.setItem('vr.rail', next ? '1' : '0'); } catch (err) { /* ignore */ }
+      refitPanes();
+    }
+  }
+
+  function closeRail() {
+    setRailOpen(false, true);
+  }
+
   function toggleRail() {
     var rail = $('#session-rail');
-    var open = rail.dataset.open !== 'false';
-    rail.dataset.open = String(!open);
-    try { localStorage.setItem('vr.rail', open ? '0' : '1'); } catch (err) { /* ignore */ }
-    refitPanes();
+    var open = !rail || rail.dataset.open !== 'false';
+    setRailOpen(!open, true);
   }
 
   /* ---------- 数据加载 ---------- */
@@ -5775,6 +5849,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
     $('#drawer-close').addEventListener('click', closeDrawer);
     $('#rail-toggle').addEventListener('click', toggleRail);
+    $('#rail-close').addEventListener('click', closeRail);
     $('#mode-btn').addEventListener('click', function () {
       app.mode = app.mode === 'lock' ? 'global' : 'lock';
       writeUrl({ mode: app.mode });
@@ -5810,6 +5885,11 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       loadReply(panes.secondary, sessionId, replyId, { noUrl: true });
     });
     document.addEventListener('keydown', function (ev) {
+      if (RailTreeCore.isRailShortcut(ev)) {
+        ev.preventDefault();
+        toggleRail();
+        return;
+      }
       if (ev.key === 'Escape') closeDrawer();
     });
     [panes.primary, panes.secondary].forEach(function (pane) {
@@ -5843,7 +5923,9 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   bind();
   setTheme(app.theme, false);
   updateModeButton();
-  if (localStorage.getItem('vr.rail') === '0') $('#session-rail').dataset.open = 'false';
+  var savedRail = null;
+  try { savedRail = localStorage.getItem('vr.rail'); } catch (err) { /* ignore */ }
+  setRailOpen(savedRail !== '0', false);
   setMode(panes.primary, 'md');
   setMode(panes.secondary, 'md');
   applySubview(panes.primary);
