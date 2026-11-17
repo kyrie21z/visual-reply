@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把结构化内容发布到 visual-reply 本地预览服务（v6，多会话）。
+"""把结构化内容发布到 visual-reply 本地预览服务（v7，多会话 + 实时面板）。
 
 支持三种载荷格式：
     json  Visual Canvas 交互画布（sections: kpis / graph / comparison / bento / steps /
@@ -13,16 +13,20 @@
     python3 publish.py --title "说明" --stdin
     python3 publish.py --title "方案" --stdin --port 18800 --cache-dir /tmp/vr
     python3 publish.py --title "子任务" --stdin --session build-42 --session-name "构建线程"
+    python3 publish.py --title "训练进度" --stdin --board train-live --board-name "训练看板" \\
+        --ttl 300 --board-status ok
 
 行为：
     1. 解析会话（--session / 环境变量 / 终端复用器 / 父进程兜底）；
-    2. 在 <cache>/.publish.lock 内提交回复：
+    2. 回复模式：在 <cache>/.publish.lock 内提交回复：
        sessions/<sid>/replies/<reply_id>.<ext> + sidecar、state.json、global/feed.jsonl，
        并同步写 v3 兼容投影 latest.<ext> / meta.json / history/；
+       面板模式（--board）：幂等写入 boards/<board_id>/，只碰 state.json 的 seq 与
+       global/board_events.jsonl，不污染回复流与全局时间线；
     3. 端口未监听时后台启动 server.py；若发现旧版服务则接管重启；
     4. 尽力 POST /api/notify 唤醒 SSE，让已打开页面立即刷新；
-    5. 仅在本次新拉起服务且未指定 --no-browser 时打开浏览器；
-    6. 输出 JSON 状态（含 ?session=&reply= 深链）。
+    5. 面板模式默认不弹浏览器（--open-browser 可强制打开），回复模式保持原行为；
+    6. 输出 JSON 状态（回复模式含 ?session=&reply= 深链，面板模式含 ?board= 深链）。
 """
 
 from __future__ import annotations
@@ -52,7 +56,7 @@ DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
 SERVER_SCRIPT = Path(__file__).resolve().parent / "server.py"
 
-VERSION = 6
+VERSION = 7
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 
 # 长度提醒阈值：只警告，不阻塞发布
@@ -338,6 +342,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="会话 ID（默认自动检测：环境变量 / 终端复用器 / 父进程）")
     parser.add_argument("--session-name", default="", help="会话显示名（会持久化到 session.json）")
     parser.add_argument("--agent", default="", help="客户端标识，如 codex / claude / antigravity")
+    parser.add_argument("--board", default="",
+                        help="实时面板 ID：同一 ID 重复发布即原地更新（不再追加回复）")
+    parser.add_argument("--board-name", default="",
+                        help="面板显示名（粘性：给过一次后，后续更新不传也保留）")
+    parser.add_argument("--project", default="",
+                        help="显式项目分组名（对面板与会话都生效）")
+    parser.add_argument("--ttl", type=int, default=0,
+                        help="新鲜度窗口（秒）：0 表示静态面板 / 不过期")
+    parser.add_argument("--board-status", default="",
+                        choices=("", "ok", "warn", "err", "complete"),
+                        help="面板状态提示（可选）")
+    parser.add_argument("--open-browser", action="store_true",
+                        help="面板模式下也强制打开浏览器（回复模式本来就会自动打开）")
     return parser.parse_args(argv)
 
 
@@ -349,13 +366,16 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cache_dir = Path(args.cache_dir).expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    (cache_dir / "history").mkdir(parents=True, exist_ok=True)
+    board_mode = bool((args.board or "").strip())
+    if not board_mode:
+        (cache_dir / "history").mkdir(parents=True, exist_ok=True)
 
     try:
         session = vr_store.resolve_session(
             explicit_session=args.session or None,
             session_name=args.session_name or None,
             agent=args.agent or None,
+            explicit_project=args.project or None,
         )
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
@@ -385,12 +405,40 @@ def main(argv=None) -> int:
             }, ensure_ascii=False))
             return 1
 
-    title = (args.title or derive_title(fmt, content) or "未命名回复").strip()
+    board_id = (args.board or "").strip()
+    board_name = (args.board_name or "").strip()[:60]
+    project = (args.project or "").strip() or session["project"]
+    if board_mode and not vr_store.is_safe_id(board_id):
+        print(json.dumps({
+            "ok": False,
+            "error": f"非法的面板 ID: {board_id!r}"
+                     "（只允许字母数字开头，且仅含 A-Z a-z 0-9 . _ -，长度 1..80）",
+        }, ensure_ascii=False))
+        return 1
 
-    # 1. 在锁内提交回复（会话归档 + v3 投影）
+    title = (args.title or derive_title(fmt, content)
+             or (board_name if board_mode else "") or "未命名回复").strip()
+
+    # 1. 在锁内提交（回复模式：会话归档 + v3 投影；面板模式：幂等更新面板）
+    receipt = None
     try:
         with vr_store.cache_lock(cache_dir):
-            receipt = vr_store.commit_reply(cache_dir, session, content, fmt, title)
+            if board_mode:
+                receipt = vr_store.upsert_board(
+                    cache_dir,
+                    {
+                        "id": board_id,
+                        "label": board_name or f"{project} · {board_id[:16]}",
+                        "custom_label": bool(board_name),
+                        "project": project,
+                        "client": session.get("client") or "agent",
+                    },
+                    content, fmt, title,
+                    ttl_sec=max(0, int(args.ttl or 0)),
+                    status_hint=args.board_status or "",
+                )
+            else:
+                receipt = vr_store.commit_reply(cache_dir, session, content, fmt, title)
     except vr_store.LockTimeout as exc:
         print(json.dumps({"ok": False, "error": str(exc), "cache_dir": str(cache_dir)},
                          ensure_ascii=False))
@@ -400,8 +448,8 @@ def main(argv=None) -> int:
         return 1
 
     session_id = session["id"]
-    reply_id = receipt["reply_id"]
     seq = receipt["seq"]
+    reply_id = receipt.get("reply_id", "")
 
     # 2. 确保服务在线（必要时接管旧版）
     #    冷启动时 4 个 Agent 可能同时行动：用 .server.lock 串行化，只有第一个进程
@@ -496,52 +544,86 @@ def main(argv=None) -> int:
         return 2
 
     # 3. 唤醒 SSE 客户端（失败不影响发布）
-    notified = notify_server(args.port, {
-        "seq": seq,
-        "session_id": session_id,
-        "session_label": receipt["session"]["label"],
-        "reply_id": reply_id,
-        "title": title,
-        "format": fmt,
-        "updated_at": receipt["feed"]["updated_at"],
-    })
+    if board_mode:
+        notified = notify_server(args.port, receipt["event"])
+    else:
+        notified = notify_server(args.port, {
+            "seq": seq,
+            "session_id": session_id,
+            "session_label": receipt["session"]["label"],
+            "reply_id": reply_id,
+            "title": title,
+            "format": fmt,
+            "updated_at": receipt["feed"]["updated_at"],
+        })
 
-    # 4. 深链：首次拉起服务时直接打开对应会话与回复
+    # 4. 深链：首次拉起服务时直接打开对应会话与回复（面板模式默认不弹浏览器）
     base_url = f"http://127.0.0.1:{args.port}"
-    query = urllib.parse.urlencode({"session": session_id, "reply": reply_id})
-    session_query = urllib.parse.urlencode({"session": session_id})
-    url = f"{base_url}/?{query}"
-    session_url = f"{base_url}/?{session_query}"
-
     browser = None
-    if started and not args.no_browser:
-        browser = open_browser(url)
 
-    result = {
-        "ok": True,
-        "version": VERSION,
-        "format": fmt,
-        "title": title,
-        "url": url,
-        "base_url": base_url,
-        "session_url": session_url,
-        "session_id": session_id,
-        "session_name": receipt["session"]["label"],
-        "reply_id": reply_id,
-        "seq": seq,
-        "port": args.port,
-        "cache_dir": str(cache_dir),
-        "latest": receipt["latest"],
-        "history_file": receipt["history_file"],
-        "history_meta": receipt["history_meta"],
-        "reply_file": receipt["reply_path"],
-        "reply_meta": receipt["reply_meta"],
-        "chars": len(content),
-        "server": server_state,
-        "server_version": info.get("version") if info else None,
-        "notified": notified,
-        "browser": browser,
-    }
+    if board_mode:
+        board_query = urllib.parse.quote(board_id)
+        url = f"{base_url}/?board={board_query}"
+        if args.open_browser and not args.no_browser:
+            browser = open_browser(url)
+        result = {
+            "ok": True,
+            "version": VERSION,
+            "mode": "board",
+            "format": fmt,
+            "title": title,
+            "url": url,
+            "base_url": base_url,
+            "board_id": board_id,
+            "board_name": receipt["board"]["label"],
+            "project": receipt["board"]["project"],
+            "ttl_sec": receipt["board"]["ttl_sec"],
+            "status_hint": receipt["board"]["status_hint"],
+            "update_count": receipt["board"]["update_count"],
+            "seq": seq,
+            "port": args.port,
+            "cache_dir": str(cache_dir),
+            "board_file": receipt["board_file"],
+            "board_meta": receipt["board_meta"],
+            "chars": len(content),
+            "server": server_state,
+            "server_version": info.get("version") if info else None,
+            "notified": notified,
+            "browser": browser,
+        }
+    else:
+        query = urllib.parse.urlencode({"session": session_id, "reply": reply_id})
+        session_query = urllib.parse.urlencode({"session": session_id})
+        url = f"{base_url}/?{query}"
+        session_url = f"{base_url}/?{session_query}"
+        if started and not args.no_browser:
+            browser = open_browser(url)
+        result = {
+            "ok": True,
+            "version": VERSION,
+            "format": fmt,
+            "title": title,
+            "url": url,
+            "base_url": base_url,
+            "session_url": session_url,
+            "session_id": session_id,
+            "session_name": receipt["session"]["label"],
+            "reply_id": reply_id,
+            "seq": seq,
+            "port": args.port,
+            "cache_dir": str(cache_dir),
+            "latest": receipt["latest"],
+            "history_file": receipt["history_file"],
+            "history_meta": receipt["history_meta"],
+            "reply_file": receipt["reply_path"],
+            "reply_meta": receipt["reply_meta"],
+            "chars": len(content),
+            "server": server_state,
+            "server_version": info.get("version") if info else None,
+            "notified": notified,
+            "browser": browser,
+        }
+
     warnings = length_warnings(parsed) if isinstance(parsed, dict) else []
     if warnings:
         result["warnings"] = warnings
