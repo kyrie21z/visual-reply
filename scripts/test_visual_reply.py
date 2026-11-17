@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""visual-reply v4 端到端自动化测试。
+"""visual-reply v7 端到端自动化测试。
 
 覆盖：
-    md / json / html 三种载荷、auto 自动识别、五种画布组件元数据、
+    md / json / html 三种载荷、auto 自动识别、八类画布组件元数据、
     前端 PAGE_HTML 组件存在性、artifact 接口、混合历史、路径穿越防护、
     旧版服务接管升级、复杂 6 列回环拓扑的 JS 几何断言、发布长度提醒，
     多会话识别与深链回执、多进程并发写入、SSE 实时推送与快速退出、
-    会话置顶/重命名与安全校验，以及开源卫生检查。
+    会话置顶/重命名与安全校验、科研表格与图表核心、实时面板健康度与
+    幂等更新、面板接口与回复流隔离，以及开源卫生检查。
 
 使用临时目录与随机可用端口，不触碰真实缓存目录；测试结束后关闭服务并清理。
 
@@ -616,10 +617,13 @@ const unread = {};
 const out = {};
 try {
   if (data.op === 'build') {
-    out.tree = api.buildRailTree(data.sessions, {
+    const opts = {
       filter: data.filter || 'all',
       unreadCountOf: function (s) { return Number(unread[s.id] || 0); }
-    });
+    };
+    if (data.boards) opts.boards = data.boards;
+    if (data.nowMs !== undefined && data.nowMs !== null) opts.nowMs = data.nowMs;
+    out.tree = api.buildRailTree(data.sessions, opts);
   } else if (data.op === 'compare') {
     out.order = (data.sessions || []).slice().sort(api.compareSessionsFixed)
       .map(function (s) { return s.id; });
@@ -629,6 +633,12 @@ try {
     out.order = api.sortRepliesDesc(data.replies || []).map(function (r) { return r.reply_id; });
   } else if (data.op === 'parse') {
     out.values = (data.sessions || []).map(function (s) { return api.parseCreatedMs(s); });
+  } else if (data.op === 'health') {
+    out.values = (data.boards || []).map(function (b) {
+      return api.computeBoardHealth(b, data.nowMs);
+    });
+  } else if (data.op === 'age') {
+    out.values = (data.ages || []).map(function (a) { return api.formatAgeShort(a); });
   } else {
     out.error = 'unknown op';
   }
@@ -723,6 +733,8 @@ try {
     out.values = (data.cases || []).map(function (c) { return api.inferDecimals(c.col, c.values); });
   } else if (data.op === 'cell') {
     out.values = (data.rows || []).map(function (r) { return api.getCell(r, data.key); });
+  } else if (data.op === 'parse') {
+    out.values = (data.cells || []).map(function (raw) { return api.parseCell(raw); });
   } else {
     out.error = 'unknown op';
   }
@@ -2116,7 +2128,9 @@ def main() -> int:
                    "focusSession", "renderRail", "renderFeed", "connectEvents",
                    "switchToLatestReply", "unreadCount", "togglePin", "renameSession",
                    "poll", "refreshLatestNow", "applyUrl", "writeUrl", "readUrl",
-                   "totalUnread", "updateDocumentTitle", "refitPanes"):
+                   "totalUnread", "updateDocumentTitle", "refitPanes",
+                   "railBoardCard", "loadBoard", "focusBoard", "handleBoardEvent",
+                   "refreshBoardClocks", "snapshotPaneView", "restorePaneView"):
             check(f"前端实现 {fn}", f"function {fn}" in page)
 
         for token in ("new EventSource('/api/events')", "URLSearchParams",
@@ -2134,7 +2148,11 @@ def main() -> int:
                       "app.lastHandledSeq", "seq <= app.lastHandledSeq",
                       ".pane-set.view-split .pane-frame { flex-direction: column; }",
                       "pane.name === 'primary') closeDrawer();",
-                      "'(' + unread + ') '", "setTimeout(function () {"):
+                      "'(' + unread + ') '", "setTimeout(function () {",
+                      ".rail-board", "rail-board-dot", "board-status-pill",
+                      "computeBoardHealth", "formatAgeShort", "tbl-meter", "tbl-sub",
+                      "实时面板", "app.sse.addEventListener('board'",
+                      "refreshBoardClocks, 5000", "params.get('board')", "'board:' +"):
             check(f"页面包含 {token}", token in page)
 
         check("会话树容器带 role=tree",
@@ -2548,6 +2566,122 @@ def main() -> int:
               "其它会话只提示，不跳转" in page or "不劫持" in page
               or "锁定当前会话" in page)
 
+        # ---------- 16e. v7 实时面板健康度与目录树（Node VM） ----------
+        print("\n[16e] 实时面板健康度与目录树（Node VM）")
+        now_ms = 1767225600000  # 2026-01-01T00:00:00Z
+        health_probe = run_rail_core(page, {
+            "op": "health", "nowMs": now_ms,
+            "boards": [
+                {"id": "h-live", "updated_epoch": now_ms / 1000 - 30, "ttl_sec": 120},
+                {"id": "h-edge", "updated_epoch": now_ms / 1000 - 120, "ttl_sec": 120},
+                {"id": "h-stale", "updated_epoch": now_ms / 1000 - 200, "ttl_sec": 120},
+                {"id": "h-dead", "updated_epoch": now_ms / 1000 - 999, "ttl_sec": 120},
+                {"id": "h-done", "updated_epoch": now_ms / 1000 - 999, "ttl_sec": 120,
+                 "status_hint": "complete"},
+                {"id": "h-alert", "updated_at": "2026-01-01T00:00:00Z", "ttl_sec": 5,
+                 "status_hint": "err"},
+                {"id": "h-static", "updated_at": "2026-01-01T00:00:00Z", "ttl_sec": 0},
+                {"id": "h-warn", "updated_at": "2026-01-01T00:00:00Z", "status_hint": "warn"},
+                {"id": "h-iso", "updated_at": "2025-12-31T23:58:00Z", "ttl_sec": 60},
+            ],
+        }, geo_dir)
+        health_values = (health_probe.get("result") or {}).get("values") or []
+        check("面板健康度核心可在 node vm 中执行",
+              len(health_values) == 9, str(health_probe.get("error")))
+        if len(health_values) == 9:
+            states = [(v.get("state"), v.get("label")) for v in health_values]
+            check("TTL 边界：age≤ttl 为 LIVE，=2×ttl 仍为 STALE，超过为 OFFLINE",
+                  states[0] == ("live", "LIVE") and states[1] == ("live", "LIVE")
+                  and states[2] == ("stale", "STALE") and states[3] == ("dead", "OFFLINE"),
+                  str(states[:4]))
+            check("status_hint complete / err 覆盖 TTL 判定",
+                  states[4] == ("complete", "DONE") and states[5] == ("err", "ALERT"),
+                  str(states[4:6]))
+            check("无 TTL 时按 static / warn 显示 BOARD / WARN",
+                  states[6] == ("static", "BOARD") and states[7] == ("stale", "WARN"),
+                  str(states[6:8]))
+            check("ISO updated_at 参与 age / overdue 计算",
+                  health_values[8].get("ageSec") == 120
+                  and health_values[8].get("ttlSec") == 60
+                  and health_values[8].get("overdueSec") == 60
+                  and health_values[0].get("overdueSec") == 0,
+                  str(health_values[8]))
+            check("缺失时间戳时 age=0 且不抛错",
+                  health_values[6].get("ageSec") == 0, str(health_values[6]))
+
+        age_probe = run_rail_core(page, {
+            "op": "age", "ages": [0, 4, 5, 59, 60, 119, 3599, 3600, 7380],
+        }, geo_dir)
+        check("formatAgeShort 覆盖 刚刚 / s / m / h+m 四档",
+              (age_probe.get("result") or {}).get("values")
+              == ["刚刚", "刚刚", "5s前", "59s前", "1m前", "1m前",
+                  "59m前", "1h0m前", "2h3m前"],
+              str(age_probe))
+
+        rail_boards = [
+            {"id": "board-pinned", "label": "CI 构建", "project": "release", "pinned": True,
+             "created_at": "2026-01-04T00:00:00+00:00", "created_seq": 6, "seq": 61,
+             "updated_at": "2026-01-04T00:00:00+00:00", "updated_epoch": now_ms / 1000,
+             "ttl_sec": 120, "status_hint": "ok"},
+            {"id": "board-alpha", "label": "alpha · train-live", "project": "alpha",
+             "pinned": False, "created_at": "2026-01-02T00:00:00+00:00", "created_seq": 7,
+             "seq": 62, "updated_at": "2026-01-02T00:00:00+00:00", "updated_epoch": 0,
+             "ttl_sec": 0, "status_hint": ""},
+            {"id": "board-ops", "label": "ops · deploy-live", "project": "gamma",
+             "pinned": False, "created_at": "2026-01-03T00:00:00+00:00", "created_seq": 8,
+             "seq": 63, "updated_at": "2026-01-03T00:00:00+00:00",
+             "updated_epoch": now_ms / 1000 - 500, "ttl_sec": 60, "status_hint": ""},
+        ]
+        board_tree_result = run_rail_core(page, {
+            "op": "build", "sessions": RAIL_SESSIONS, "boards": rail_boards,
+            "unread": ["alpha-old"], "nowMs": now_ms}, geo_dir)
+        board_tree = ((board_tree_result.get("result") or {}).get("tree")
+                      if board_tree_result.get("ok") else None)
+        check("目录树核心接受 boards 扩展", bool(board_tree),
+              str(board_tree_result.get("error")))
+        if board_tree:
+            pinned_group = board_tree.get("pinned") or {}
+            pinned_board_ids = [b.get("id") for b in pinned_group.get("boards", [])]
+            project_board_ids = {g.get("key"): [b.get("id") for b in g.get("boards", [])]
+                                 for g in board_tree.get("projects", [])}
+            check("置顶面板与置顶会话同组且不重复出现",
+                  pinned_board_ids == ["board-pinned"]
+                  and all("board-pinned" not in ids for ids in project_board_ids.values()),
+                  str((pinned_board_ids, project_board_ids)))
+            check("面板参与项目分组且纯面板项目也会出现",
+                  project_board_ids.get("alpha") == ["board-alpha"]
+                  and project_board_ids.get("gamma") == ["board-ops"],
+                  str(project_board_ids))
+            check("tree.totalCount 同时计入会话与面板",
+                  board_tree.get("totalCount") == len(RAIL_SESSIONS) + len(rail_boards),
+                  str(board_tree.get("totalCount")))
+            check("面板参与项目排序（gamma 最新创建排第一）",
+                  [g.get("key") for g in board_tree.get("projects", [])]
+                  == ["gamma", "beta", "alpha"],
+                  str([g.get("key") for g in board_tree.get("projects", [])]))
+
+        board_unread_result = run_rail_core(page, {
+            "op": "build", "sessions": RAIL_SESSIONS, "boards": rail_boards,
+            "unread": ["alpha-old"], "filter": "unread", "nowMs": now_ms}, geo_dir)
+        board_unread_tree = ((board_unread_result.get("result") or {}).get("tree")
+                             if board_unread_result.get("ok") else None)
+        check("unread 筛选把 STALE / OFFLINE / err 面板计入未读",
+              bool(board_unread_tree) and board_unread_tree.get("totalCount") == 2
+              and any([b.get("id") for b in g.get("boards", [])] == ["board-ops"]
+                      for g in board_unread_tree.get("projects", [])),
+              str(board_unread_tree))
+
+        board_pinned_result = run_rail_core(page, {
+            "op": "build", "sessions": RAIL_SESSIONS, "boards": rail_boards,
+            "filter": "pinned"}, geo_dir)
+        board_pinned_tree = ((board_pinned_result.get("result") or {}).get("tree")
+                             if board_pinned_result.get("ok") else None)
+        check("pinned 筛选同时返回置顶会话与置顶面板",
+              bool(board_pinned_tree) and board_pinned_tree.get("totalCount") == 3
+              and [b.get("id") for b in (board_pinned_tree.get("pinned") or {}).get("boards", [])]
+              == ["board-pinned"] and not board_pinned_tree.get("projects"),
+              str(board_pinned_tree))
+
         # ---------- 17. 存储层 created_seq 与固定排序 ----------
         print("\n[17] 存储层 created_seq 与固定排序")
         spec = importlib.util.spec_from_file_location("vr_store_rail", STORE)
@@ -2627,7 +2761,8 @@ def main() -> int:
         print("\n[17b] v6 科研画布发布与端到端接口")
         code, sci = publish(port, cache, SCIENTIFIC_TEXT, "科研画布端到端")
         check("v6 科研画布发布成功", code == 0 and sci.get("ok") is True, str(sci)[:400])
-        check("publish 版本为 6", sci.get("version") == 6, str(sci.get("version")))
+        check(f"publish 版本为 {EXPECTED_VERSION}", sci.get("version") == EXPECTED_VERSION,
+              str(sci.get("version")))
         check("科研画布自动识别为 json", sci.get("format") == "json", str(sci.get("format")))
 
         status, sci_latest = get_json(f"{base}/api/latest")
@@ -2715,6 +2850,252 @@ def main() -> int:
         check("科研画布样例不含本机路径或邮箱",
               not any(pattern in sci_serialized for pattern in home_patterns)
               and "@" not in sci_serialized)
+
+        # ---------- 17c. v7 实时面板幂等更新、隔离与端到端接口 ----------
+        print("\n[17c] v7 实时面板幂等更新、隔离与端到端接口")
+        feed_path = cache / "global" / "feed.jsonl"
+        history_dir = cache / "history"
+        sessions_dir = cache / "sessions"
+
+        def reply_projection() -> dict:
+            snap = {}
+            for name in ("latest.json", "latest.html", "latest.md", "meta.json"):
+                path = cache / name
+                snap[name] = path.read_bytes() if path.is_file() else None
+            snap["feed"] = feed_path.read_bytes() if feed_path.is_file() else None
+            snap["history"] = (sorted(p.name for p in history_dir.iterdir())
+                               if history_dir.is_dir() else [])
+            snap["sessions"] = (sorted(p.name for p in sessions_dir.iterdir())
+                                if sessions_dir.is_dir() else [])
+            return snap
+
+        projection_before = reply_projection()
+        state_before = json.loads((cache / "state.json").read_text(encoding="utf-8"))
+
+        board_one = {
+            "headline": "build 4821 · 3/5 stages green",
+            "sections": [{
+                "type": "table",
+                "title": "Stages",
+                "columns": [
+                    {"key": "stage", "label": "Stage"},
+                    {"key": "progress", "label": "Progress", "bar": True, "max": 100,
+                     "unit": "%"},
+                    {"key": "tests", "label": "Tests", "decimals": 0},
+                ],
+                "rows": [
+                    {"id": "lint", "stage": "lint",
+                     "progress": {"value": 100, "sub": "done", "status": "ok"}, "tests": 0},
+                    {"id": "unit", "stage": "unit",
+                     "progress": {"value": 78, "sub": "1402/1798"}, "tests": 1402},
+                ],
+            }],
+        }
+        board_one_text = json.dumps(board_one, ensure_ascii=False)
+        code, b1 = publish(port, cache, board_one_text, "构建状态", extra=[
+            "--board", "ci-live", "--board-name", "CI 构建", "--project", "release",
+            "--ttl", "120", "--board-status", "ok"])
+        check("v7 面板首次发布成功", code == 0 and b1.get("ok") is True, str(b1)[:400])
+        check("面板回执标记 mode=board 且带 board 深链",
+              b1.get("mode") == "board" and b1.get("board_id") == "ci-live"
+              and str(b1.get("url", "")).endswith("?board=ci-live")
+              and b1.get("version") == EXPECTED_VERSION, str(b1)[:400])
+        check("首轮回执保留名称 / 项目 / TTL / 状态提示",
+              b1.get("board_name") == "CI 构建" and b1.get("project") == "release"
+              and b1.get("ttl_sec") == 120 and b1.get("status_hint") == "ok"
+              and b1.get("update_count") == 1, str(b1)[:400])
+        check("面板载荷落在 boards/<bid>/payload.json",
+              (cache / "boards" / "ci-live" / "payload.json").is_file()
+              and not (cache / "boards" / "ci-live" / "payload.md").exists(),
+              str(sorted(p.name for p in (cache / "boards" / "ci-live").iterdir())))
+        check("面板发布不写 latest.* / meta.json / history/ / sessions/",
+              reply_projection() == projection_before, "回复侧投影被面板污染")
+
+        state_after = json.loads((cache / "state.json").read_text(encoding="utf-8"))
+        check("面板只推进 seq 并记录 latest_board_id",
+              int(state_after.get("seq") or 0) == int(state_before.get("seq") or 0) + 1
+              and state_after.get("latest_board_id") == "ci-live"
+              and state_after.get("latest_session_id") == state_before.get("latest_session_id")
+              and state_after.get("latest_reply_id") == state_before.get("latest_reply_id"),
+              str(state_after)[:400])
+
+        status, boards_payload = get_json(f"{base}/api/boards")
+        listed = boards_payload.get("boards") or []
+        check("/api/boards 返回面板列表与计数",
+              status == 200 and boards_payload.get("count") == len(listed)
+              and any(b.get("id") == "ci-live" for b in listed), str(boards_payload)[:400])
+        live_listed = next((b for b in listed if b.get("id") == "ci-live"), {})
+        check("/api/boards 面板元数据完整",
+              live_listed.get("label") == "CI 构建"
+              and live_listed.get("project") == "release"
+              and live_listed.get("update_count") == 1
+              and live_listed.get("ttl_sec") == 120
+              and live_listed.get("status_hint") == "ok"
+              and float(live_listed.get("updated_epoch") or 0) > 0, str(live_listed)[:400])
+
+        status, board_detail = get_json(f"{base}/api/boards/ci-live")
+        check("/api/boards/<bid> 返回元数据与正文",
+              status == 200 and (board_detail.get("board") or {}).get("id") == "ci-live"
+              and board_detail.get("content") == board_one_text, str(status))
+
+        status, _, _ = raw_request(port, "GET", "/api/artifact/board/ci-live")
+        check("非 html 面板的 artifact 返回 404", status == 404, str(status))
+        status, _, _ = raw_request(port, "GET", "/api/boards/..%2F..%2Fmeta.json")
+        check("/api/boards 路径穿越被拒绝", status == 400, str(status))
+        status, _, _ = raw_request(port, "GET", "/artifact/board/..%2F..%2Fmeta.json")
+        check("/artifact/board 路径穿越被拒绝", status == 400, str(status))
+        status, _, _ = raw_request(port, "GET", "/api/boards/missing-board")
+        check("/api/boards 未知面板返回 404", status == 404, str(status))
+
+        status, body, _ = raw_request(
+            port, "POST", "/api/boards/ci-live",
+            body=json.dumps({"label": "CI 构建 · 主分支"}),
+            headers={"Content-Type": "application/json"})
+        renamed = json.loads(body.decode("utf-8") or "{}")
+        check("POST /api/boards/<bid> 可重命名并固化 custom_label",
+              status == 200 and renamed.get("ok") is True
+              and (renamed.get("board") or {}).get("label") == "CI 构建 · 主分支"
+              and (renamed.get("board") or {}).get("custom_label") is True,
+              str(renamed)[:400])
+        status, body, _ = raw_request(
+            port, "POST", "/api/boards/ci-live",
+            body=json.dumps({"pinned": True}),
+            headers={"Content-Type": "application/json"})
+        pinned_board = json.loads(body.decode("utf-8") or "{}")
+        check("POST /api/boards/<bid> 可置顶且不改动更新时间",
+              status == 200 and (pinned_board.get("board") or {}).get("pinned") is True
+              and (pinned_board.get("board") or {}).get("updated_at")
+              == (renamed.get("board") or {}).get("updated_at"),
+              str(pinned_board)[:400])
+        status, _, _ = raw_request(
+            port, "POST", "/api/boards/ci-live", body=json.dumps({}),
+            headers={"Content-Type": "application/json"})
+        check("POST /api/boards/<bid> 无字段返回 400", status == 400, str(status))
+        status, _, _ = raw_request(
+            port, "POST", "/api/boards/missing-board", body=json.dumps({"pinned": True}),
+            headers={"Content-Type": "application/json"})
+        check("POST 未知面板返回 404", status == 404, str(status))
+
+        board_two = {
+            "headline": "build 4821 · 5/5 stages green",
+            "sections": [{
+                "type": "kpis",
+                "items": [
+                    {"label": "stages", "value": "5/5", "status": "ok"},
+                    {"label": "tests", "value": "1798", "status": "ok"},
+                ],
+            }],
+        }
+        board_two_text = json.dumps(board_two, ensure_ascii=False)
+        code, b2 = publish(port, cache, board_two_text, "构建状态", extra=[
+            "--board", "ci-live", "--project", "release", "--ttl", "120"])
+        check("重复发布同一 board 原地更新（不新增回复）",
+              code == 0 and b2.get("update_count") == 2
+              and int(b2.get("seq") or 0) == int(b1.get("seq") or 0) + 1,
+              str(b2)[:400])
+        check("--board-name 粘性：心跳不传仍保留自定义名",
+              b2.get("board_name") == "CI 构建 · 主分支", str(b2.get("board_name")))
+        check("心跳未传 --board-status 时清空状态提示",
+              b2.get("status_hint") == "", str(b2.get("status_hint")))
+        status, board_detail2 = get_json(f"{base}/api/boards/ci-live")
+        check("面板正文被最新心跳覆盖",
+              status == 200 and board_detail2.get("content") == board_two_text,
+              str(status))
+        check("心跳保留 pinned 状态",
+              (board_detail2.get("board") or {}).get("pinned") is True,
+              str(board_detail2.get("board"))[:300])
+        check("心跳同样不污染回复侧投影", reply_projection() == projection_before,
+              "回复侧投影被面板心跳污染")
+
+        html_board = "<!doctype html><html><body><h1>build 4821</h1></body></html>"
+        code, b3 = publish(port, cache, html_board, "构建状态", fmt="html", extra=[
+            "--board", "ci-live", "--project", "release", "--ttl", "60"])
+        check("同一 board 可切换为 html 载荷",
+              code == 0 and b3.get("format") == "html"
+              and b3.get("update_count") == 3, str(b3)[:400])
+        check("切换格式后旧 payload.json 被删除",
+              (cache / "boards" / "ci-live" / "payload.html").is_file()
+              and not (cache / "boards" / "ci-live" / "payload.json").exists(),
+              str(sorted(p.name for p in (cache / "boards" / "ci-live").iterdir())))
+        status, body, headers = raw_request(port, "GET", "/artifact/board/ci-live")
+        check("html 面板 artifact 返回原文",
+              status == 200 and body.decode("utf-8") == html_board
+              and "text/html" in headers.get("Content-Type", ""),
+              f"{status} / {headers.get('Content-Type')}")
+
+        sse = sse_connect(port)
+        banner = read_until(sse, b": connected", time.time() + 6)
+        check("面板 SSE 已连接", b": connected" in banner, banner[:120])
+        board_four = {"headline": "build 4821 · done", "sections": [{"type": "prose",
+                                                                     "content": "全部通过。"}]}
+        started_at = time.time()
+        code, b4 = publish(
+            port, cache, json.dumps(board_four, ensure_ascii=False), "构建状态", extra=[
+                "--board", "ci-live", "--project", "release", "--ttl", "60",
+                "--board-status", "complete"])
+        frame = read_until(sse, ("id: " + str(b4.get("seq"))).encode(), started_at + 4)
+        elapsed = time.time() - started_at
+        try:
+            sse.close()
+        except OSError:
+            pass
+        check("面板发布后 SSE 在 2 秒内推送",
+              b"event: board" in frame and elapsed < 2.0, f"{elapsed:.2f}s")
+        board_live_events = []
+        for match in re.finditer(rb"data: (.+?)\r?\n", frame):
+            try:
+                board_live_events.append(json.loads(match.group(1).decode("utf-8")))
+            except ValueError:
+                continue
+        board_event = next((e for e in board_live_events
+                            if e.get("seq") == b4.get("seq")), None)
+        check("SSE 面板事件字段完整",
+              board_event is not None
+              and board_event.get("event_type") == "board"
+              and board_event.get("board_id") == "ci-live"
+              and board_event.get("update_count") == 4
+              and board_event.get("status_hint") == "complete", str(board_event)[:400])
+        check("b4 回执更新计数为 4",
+              code == 0 and b4.get("update_count") == 4, str(b4)[:300])
+
+        status, board_state = get_json(
+            f"{base}/api/state?since={int(state_before.get('seq') or 0)}")
+        merged_events = board_state.get("events") or []
+        board_events = [e for e in merged_events if e.get("event_type") == "board"]
+        check("/api/state 合并面板事件且 event_type=board",
+              status == 200 and len(board_events) == 4
+              and all(e.get("board_id") == "ci-live" for e in board_events)
+              and board_events[-1].get("seq") == b4.get("seq"),
+              str(board_events)[:400])
+        check("/api/state 最新会话指针不被面板改写",
+              board_state.get("latest_session_id") == state_before.get("latest_session_id")
+              and board_state.get("latest_reply_id") == state_before.get("latest_reply_id"),
+              str(board_state.get("latest_session_id")))
+
+        status, sessions_payload = get_json(f"{base}/api/sessions")
+        boards_field = sessions_payload.get("boards") or []
+        live_board = next((b for b in boards_field if b.get("id") == "ci-live"), {})
+        check("/api/sessions 同时返回 boards 字段",
+              status == 200 and bool(live_board), str(boards_field)[:300])
+        check("面板记录带健康度所需字段",
+              live_board.get("ttl_sec") == 60
+              and live_board.get("status_hint") == "complete"
+              and live_board.get("update_count") == 4
+              and live_board.get("format") == "json"
+              and float(live_board.get("updated_epoch") or 0) > 0,
+              str(live_board)[:400])
+
+        status, feed_payload = get_json(f"{base}/api/feed?limit=200")
+        check("全局时间线不包含面板刷新",
+              status == 200 and not any(
+                  item.get("event_type") == "board" or item.get("board_id")
+                  for item in feed_payload.get("items", [])),
+              str(feed_payload)[:300])
+        check("全部面板操作后回复侧投影仍不变",
+              reply_projection() == projection_before)
+
+        status, _, _ = raw_request(port, "GET", "/artifact/board/ci-live")
+        check("面板切回 json 后 artifact 恢复 404", status == 404, str(status))
 
     finally:
         print("\n[18] 清理")

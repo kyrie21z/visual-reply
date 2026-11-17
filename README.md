@@ -12,6 +12,8 @@ answer into a scrollback buffer, the agent publishes a structured payload to
 Charts, topology maps and scorecards render in the browser; every long explanation is
 folded into a side drawer until someone clicks it. Run several agents at once and they
 land in separate session lanes in the same page, without stepping on each other.
+Long-running jobs can instead publish a **live board** that updates in place — same id,
+fresh content, no reply spam.
 
 Runs on the Python 3.10+ standard library. No pip install, no API key, no telemetry,
 no network calls of its own.
@@ -132,6 +134,66 @@ process and project root. Same shell stays in one lane; a different terminal get
 
 Deep links: `?session=<sid>&reply=<rid>`, plus optional `&split=<sid2>`, `&layout=h|v`
 and `&mode=lock|global`. The `url` in every publish receipt is already such a link.
+
+### Live Boards
+
+Not every answer is a one-shot reply. Training progress, a CI build, a long-running job —
+these want **one board that keeps refreshing**, not twenty archived rounds. Pass `--board`
+and every publish with that ID overwrites the same board in place:
+
+```bash
+# First publish creates the board
+python3 scripts/publish.py --title "Build status" --stdin \
+  --board ci-live --board-name "CI build" --project "Release" --ttl 120 <<'JSON'
+{
+  "headline": "build 4821 · 3/5 stages green",
+  "sections": [
+    { "type": "table",
+      "columns": [
+        { "key": "stage", "label": "Stage" },
+        { "key": "progress", "label": "Progress", "bar": true, "max": 100, "unit": "%" },
+        { "key": "tests", "label": "Tests", "decimals": 0 }
+      ],
+      "rows": [
+        { "id": "lint", "stage": "lint", "progress": { "value": 100, "sub": "done", "status": "ok" }, "tests": 0 },
+        { "id": "unit", "stage": "unit", "progress": { "value": 78, "sub": "1402/1798" }, "tests": 1402 }
+      ] }
+  ]
+}
+JSON
+
+# Every heartbeat: same --board, fresh content
+python3 scripts/publish.py --title "Build status" --stdin \
+  --board ci-live --ttl 120 <<'JSON'
+{ "headline": "build 4821 · 4/5 stages green", "sections": [ … ] }
+JSON
+```
+
+- **Isolated from replies.** A board never writes `latest.*`, `meta.json`, `history/`,
+  `sessions/` or the reply feed, so it cannot pollute the global timeline and cannot
+  hijack a pane. The reply stream and the board stream share the global `seq` but land
+  in separate event files; SSE frames are tagged `event: reply` or `event: board`.
+- **Sticky metadata.** A custom `--board-name` persists after the first publish; later
+  heartbeats only need the ID and the payload. `--project` applies on every heartbeat
+  (defaults to the session's project).
+- **Health state machine.** With `--ttl <seconds>` the rail card and the pane header
+  derive a health state from the board's age: `LIVE` (age ≤ ttl), `STALE`
+  (ttl < age ≤ 2×ttl), `OFFLINE` (older). `--board-status complete` pins `DONE`,
+  `--board-status err` pins `ALERT`; a TTL-less board shows `BOARD`, or `WARN` when
+  published with `--board-status warn`. Relative times recompute locally every 5 s with
+  no network traffic.
+- **Rail cards.** Boards appear in the same pinned / project folders as sessions, with
+  health dot, `📊`, update count and relative age. Hover for `★/☆` pin, `改` rename and
+  `◫` split; the split target list gets its own *实时面板* group.
+- **In-place refresh.** When a `event: board` frame arrives for the board you are
+  currently viewing, only that pane re-renders — scroll position, table sort/search/
+  baseline, hidden chart series, topology zoom and the open Inspector drawer all
+  survive. Other panes only see the rail dot update.
+- **Inline table meters.** `"bar": true` on a column or cell draws a progress meter,
+  `max` sets the full-bar value and `sub` adds a small sub-line. Exports (LaTeX /
+  Markdown / CSV) stay numeric.
+- **Deep links.** `?board=<bid>` focuses a board; `?split=board:<bid>` opens it in the
+  secondary pane. Board receipts already contain `?board=`.
 
 ### Live reload
 
@@ -322,8 +384,8 @@ Everything except `type` is optional.
 | `node.label` | ≤ 12 chars | Two-line clamp, then ellipsis |
 | `edge.label` | ≤ 10 chars | Capsule label; over 14 chars raises a warning |
 | `span` (section) | `1` `2` | Two-column grid: one column or full width |
-| `columns[]` | `key`, `label`, `align`, `highlight`, `higher_is_better`, `decimals`, `unit`, `delta_unit` | Table column spec; `higher_is_better` drives best/second marks and Δ tone |
-| `rows[]` | `id`, `cells`, `is_baseline`, `emphasis`, `divider_before`, `details`, `files` | A cell is a primitive or `{value, display, note, status}` |
+| `columns[]` | `key`, `label`, `align`, `highlight`, `higher_is_better`, `decimals`, `unit`, `delta_unit`, `bar`, `max` | Table column spec; `higher_is_better` drives best/second marks and Δ tone; `bar: true` renders an inline meter, `max` sets the full-bar value |
+| `rows[]` | `id`, `cells`, `is_baseline`, `emphasis`, `divider_before`, `details`, `files` | A cell is a primitive or `{value, display, note, status, bar, max, sub}`; `sub` is a small sub-line, exports use the numeric value only |
 | `chart_type` | `bar` `line` `scatter` `heatmap` | Defaults to `bar` |
 
 A top-level `{ "headline": …, "nodes": [...], "edges": [...] }` is accepted as a
@@ -349,6 +411,12 @@ a prose-only payload needs an explicit `--format json`.
 | `--session` | Session id; skips auto-detection, rejected if unsafe |
 | `--session-name` | Human-readable session label, persisted in `session.json` |
 | `--agent` | Client badge (`codex`, `claude`, `antigravity`, …) |
+| `--board` | Live board id; repeated publishes with the same id update it in place instead of appending a reply |
+| `--board-name` | Board label (sticky: persisted after the first publish) |
+| `--project` | Explicit project folder name, for boards and sessions |
+| `--ttl` | Freshness window in seconds; `0` (default) means a static board |
+| `--board-status` | Optional status hint: `ok` / `warn` / `err` / `complete` |
+| `--open-browser` | Force the browser open in board mode (reply mode already does) |
 
 Cache layout:
 
@@ -356,14 +424,19 @@ Cache layout:
 ~/.cache/agent-visual-reply/
 ├── .publish.lock                          # write lock (flock / msvcrt.locking)
 ├── .server.lock                           # startup lock: one cold-start at a time
-├── state.json                             # version, seq, latest session/reply pointers
+├── state.json                             # version 7, seq, latest session/reply pointers
 ├── sessions/
 │   └── <sid>/
 │       ├── session.json                   # label, client, project, pinned, seq, reply_count
 │       └── replies/
 │           ├── 20260101-120000-000001-title.md
 │           └── 20260101-120000-000001-title.md.meta.json
-├── global/feed.jsonl                      # append-only cross-session timeline
+├── boards/                                # v7 live boards: one directory per board
+│   └── <bid>/
+│       ├── board.json                     # label, project, pinned, ttl_sec, status_hint, update_count, seq
+│       └── payload.json | .md | .html     # overwritten in place; stale extensions removed
+├── global/feed.jsonl                      # append-only cross-session reply timeline
+├── global/board_events.jsonl              # board events, capped at the last 200 lines
 ├── latest.json | latest.html | latest.md  # v3 projection, exactly one per format
 ├── meta.json                              # v3 projection + seq / session_id / reply_id
 ├── server.log
@@ -374,7 +447,8 @@ Cache layout:
 ```
 
 `reply_id` is `<stamp>-<seq:06d>-<ascii-slug>`: sortable, unique under concurrency and
-safe to drop straight into a URL.
+safe to drop straight into a URL. Replies and boards share `state.json`'s `seq` but keep
+separate event logs, so `/api/feed` and the rail timeline never contain board churn.
 
 ---
 
@@ -388,12 +462,16 @@ safe to drop straight into a URL.
 | `GET /api/history/<filename>` | `{format, title, content, updated_at, mtime}` |
 | `GET /artifact/latest` | Raw HTML artifact, `text/html; charset=utf-8`; 404 for other formats |
 | `GET /artifact/history/<filename>` | Raw historical HTML artifact |
-| `GET /api/sessions` | `{version, seq, latest_session_id, sessions, legacy_count}`, pinned first then newest |
+| `GET /api/sessions` | `{version, seq, latest_session_id, sessions, boards, legacy_count}`, pinned first then newest |
 | `GET /api/sessions/<sid>/replies?limit=200` | Reply rounds of one session, newest first |
 | `GET /api/sessions/<sid>/replies/<rid>` | `{version, session, reply, content}` |
-| `GET /api/feed?limit=50` | Cross-session timeline, including un-sessioned v3 archives |
-| `GET /api/state?since=<seq>` | Incremental events for catch-up |
-| `GET /api/events` | SSE stream (`text/event-stream`, 20 s keepalive) |
+| `GET /api/boards` | `{version, seq, boards, count}` |
+| `GET /api/boards/<bid>` | `{version, board, content}`; 400 for an unsafe id, 404 when missing |
+| `POST /api/boards/<bid>` | Update `{label, pinned}`; 400 / 404 as above |
+| `GET /artifact/board/<bid>` | Raw HTML board, `text/html; charset=utf-8`; 404 for other formats |
+| `GET /api/feed?limit=50` | Cross-session reply timeline, including un-sessioned v3 archives |
+| `GET /api/state?since=<seq>` | Incremental reply + board events, merged by seq |
+| `GET /api/events` | SSE stream (`text/event-stream`, 20 s keepalive); `event: reply` or `event: board` |
 | `POST /api/notify` | Wake SSE immediately after a publish |
 | `POST /api/sessions/<sid>` | Update `{label, pinned}` atomically |
 | `GET /artifact/session/<sid>/<rid>` | Raw HTML for one session reply |
@@ -429,6 +507,15 @@ negative, constant and empty ranges, bar bounds, line path splitting across `nul
 hidden-series toggles, Pareto frontiers, normalized heatmaps), plus a full scientific
 canvas publish/read-back round trip and shorthand table/chart/prose detection.
 
+v7 adds: the board health state machine and relative-time formatter in a Node VM
+(every health branch, TTL boundaries, epoch vs. ISO timestamps, `刚刚`/`s`/`m`/`h`
+formatting); board-aware rail tree (pinned boards, project-only groups, unread filters,
+pinned boards never counted twice); inline table meters (`bar` / `max` / `sub` parsing
+and numeric-only exports); an idempotent board publish round trip proving replies stay
+untouched (`latest.*`, `meta.json`, `history/` and the reply feed never change), board
+list/read/pin/rename endpoints, traversal rejection on `/api/boards/..` and
+`/artifact/board/..`, `event: board` SSE delivery, and the HTML board artifact route.
+
 No network access is required.
 
 ---
@@ -448,6 +535,8 @@ No network access is required.
 | New reply does not appear automatically | The dot shows *reconnecting* when SSE drops — a 3 s poll takes over; `/api/events` may be blocked by a proxy |
 | One agent shows up as several sessions | The parent process or terminal pane changed between calls; pin it with `--session` / `--session-name` |
 | Publish lands in the wrong session | A stale client env var (`CODEX_THREAD_ID`, `CLAUDE_SESSION_ID`, …) is present; `--session` always wins |
+| A board stays `OFFLINE` | Each heartbeat must pass the same `--board`, and `--ttl` should be at least twice the heartbeat interval |
+| A board update replaced the pane you were reading | It should not: under focus lock only a pane already showing that board re-renders in place. If the tab is in *follow global* mode, switch back to *lock* |
 
 ---
 

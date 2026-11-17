@@ -3,11 +3,25 @@ name: visual-reply
 description: Visual-First 交互画布：把结论、架构、方案对比、执行计划、实验表格与图表发布为本机可视化网页。JSON 画布（拓扑图 / 对比评分 / Bento / 步骤条 / KPI / 科研表格 / 柱线散点热力 / 长文）、HTML Artifact 沙箱、Markdown 兼容三模式，详情折叠进右侧抽屉；多会话工作台自动识别 Agent 线程，左侧会话栏 + 焦点锁 + 分屏，终端只回传短结论与 http://127.0.0.1:18765 链接。
 ---
 
-# Visual Reply v6
+# Visual Reply v7
 
 把结构化结论发布成本机可视化网页，让用户在浏览器里**看**，而不是在终端里滚动长文。
 
 核心原则：**首屏无长句**。首屏只出现交互图表、Bento 卡片、对比评分条、节点拓扑；所有解释、代码、文件清单默认折叠进右侧 Inspector 抽屉，点击才展开（Progressive Disclosure）。
+
+## 极简速查（首次 / 压缩后只读 1–40 行即可）
+
+```bash
+# 先用 write_file 把 JSON 写入 scratch/canvas.json 或 /tmp/canvas.json，严禁把大 JSON 塞进命令行参数
+python3 "${SKILL_DIR}/scripts/publish.py" --title "短标题" --format json --file /tmp/canvas.json
+# 实时面板（原地幂等更新，不追加历史、不弹窗）：
+python3 "${SKILL_DIR}/scripts/publish.py" --board <id> --ttl 1200 --project "项目" --format json --file /tmp/board.json
+```
+
+- 画布骨架：`{"headline": "≤30 字结论", "badges": [{"text","tone":"ok|warn|err|info"}], "sections": [...]}`；组件 `kpis` / `graph` / `comparison` / `bento` / `steps` / `table` / `chart` / `prose`，长解释全部塞 `details`。
+- 表格与图表：`table` 支持 `columns[]` + `rows[]`（单元格 `{value, display, note, status, bar, max, sub}`，`bar: true` 画行内进度条）；`chart` 的 `chart_type` 取 `bar` / `line` / `scatter` / `heatmap`，纯 SVG 离线渲染。
+- 面板深链与健康：`?board=<id>` 聚焦、`?split=board:<id>` 右窗格分屏；有 TTL → `LIVE` / `STALE` / `OFFLINE`，`--board-status` 可覆盖为 `DONE` / `ALERT`（TTL=0 缺省 `BOARD`，`warn` → `WARN`）。
+- 硬上限与回执：`headline` ≤ 30 字、`node.label` ≤ 12 字、`edge.label` ≤ 10 字（超长只进 `warnings`，退出码仍为 0）；终端只回 3–6 行结论 + 完整未截断 `url`；压缩后复查只需读本文件 `1–40` 行，勿翻下文或 `server.py`。
 
 ## 定位脚本（跨客户端通用）
 
@@ -108,11 +122,77 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | --- | --- |
 | `?session=<sid>` | 聚焦某个会话 |
 | `?reply=<rid>` | 直接打开某条回复（配合 `session`） |
-| `?split=<sid2>` | 右侧分屏显示第二个会话 |
+| `?board=<bid>` | 聚焦某块实时面板 |
+| `?split=<sid2>` / `?split=board:<bid>` | 右侧分屏显示第二个会话或面板 |
 | `?layout=h\|v` | 分屏方向：左右 / 上下 |
 | `?mode=lock\|global` | 焦点锁 / 跟随全局 |
 
 发布回执里的 `url` 已经是 `?session=<sid>&reply=<rid>` 深链，直接打开即可定位到这次回复。
+
+---
+
+## 实时面板（v7 Live Board）
+
+适合「同一个看板反复刷新」的场景：训练进度、CI 构建状态、长任务心跳。面板与回复流完全隔离——重复发布**原地覆盖**同一块面板，不追加回复、不写 `latest.*` / `history/` / `sessions/`，也不会抢走用户正在读的主窗格。
+
+```bash
+# 第一次发布：创建面板
+python3 ${SKILL_DIR}/scripts/publish.py \
+  --title "训练进度" --stdin \
+  --board train-live --board-name "训练看板" --project "模型训练" \
+  --ttl 300 --board-status ok <<'JSON'
+{
+  "headline": "Epoch 12 / 20 · loss 0.42",
+  "sections": [
+    { "type": "kpis", "items": [
+      { "label": "loss", "value": "0.42", "status": "ok" },
+      { "label": "throughput", "value": "1180 tok/s" }
+    ] },
+    { "type": "table",
+      "columns": [
+        { "key": "epoch", "label": "Epoch" },
+        { "key": "progress", "label": "进度", "bar": true, "max": 100, "unit": "%" },
+        { "key": "loss", "label": "Loss", "higher_is_better": false, "decimals": 3 }
+      ],
+      "rows": [
+        { "id": "e11", "epoch": 11, "progress": { "value": 55, "sub": "11/20" }, "loss": 0.51 },
+        { "id": "e12", "epoch": 12, "progress": { "value": 60, "sub": "12/20", "status": "ok" }, "loss": 0.42 }
+      ] }
+  ]
+}
+JSON
+
+# 之后每轮心跳：同一条命令换个 id 之外什么都不用变，面板原地刷新
+python3 ${SKILL_DIR}/scripts/publish.py \
+  --title "训练进度" --stdin --board train-live --ttl 300 <<'JSON'
+{ "headline": "Epoch 13 / 20 · loss 0.38", "sections": [ … ] }
+JSON
+```
+
+- `--board-name` 是**粘性**的：给过一次后，后续更新不传也保留；`--project` 同理控制左栏分组。
+- `--ttl` 是新鲜度窗口（秒），面板健康度按它推导；不传或 `0` 表示静态面板。
+- `--board-status` 可选 `ok` / `warn` / `err` / `complete`，用于一次性任务显式宣告结果。
+- 面板模式默认不弹浏览器（`--open-browser` 可强制打开），适合高频心跳。
+
+健康度状态机：
+
+| 状态 | 触发条件 | 左栏色点 |
+| --- | --- | --- |
+| `DONE` | `--board-status complete` | 绿 |
+| `ALERT` | `--board-status err` | 红 |
+| `LIVE` | TTL > 0 且 `age ≤ ttl` | 绿（呼吸） |
+| `STALE` | TTL > 0 且 `ttl < age ≤ 2×ttl` | 黄 |
+| `OFFLINE` | TTL > 0 且 `age > 2×ttl` | 灰 |
+| `BOARD` | TTL = 0 且无状态提示 | 蓝 |
+| `WARN` | TTL = 0 且 `--board-status warn` | 黄 |
+
+页面交互：
+
+- **左栏面板卡片**：置顶分组与项目分组都会列出面板，卡片上带健康色点、`📊` 图标、标题、状态胶囊、`#更新次数 · 相对时间`；悬停出现 `★/☆` 置顶、`改` 重命名、`◫` 分屏三个按钮。
+- **原地刷新**：SSE `event: board` 到达时，只有当前正在看这块面板的窗格才重绘，并且保留滚动位置、表格排序/搜索/基准 Δ、图表隐藏系列、拓扑缩放，以及右侧 Inspector 抽屉——正在读的内容不会被替换。
+- **阅读守卫**：其它面板更新只在左栏更新色点与相对时间，不打断当前阅读；相对时间每 5 秒本地刷新，不产生任何网络请求。
+- **表格行内进度条**：列或单元格写 `bar: true` 时渲染 `.tbl-meter` 进度条，`max` 决定满格值，`sub` 显示小字副行；导出 LaTeX / Markdown / CSV 时只导出数值，保持科研表格可粘贴。
+- **深链**：`?board=<id>` 聚焦面板；`?split=board:<id>` 在右窗格分屏对比面板；发布回执里的 `url` 已直接带 `?board=`。
 
 ---
 
@@ -264,8 +344,8 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `tone`（card） | `accent` `ok` `warn` `err` | Bento 卡片描边与强调色 |
 | `span`（card） | `1` `2` | Bento 列宽，4 列栅格 |
 | `span`（section） | `1` `2` | 桌面两列栅格中占 1 列或整行；分屏与窄屏自动回落整行 |
-| `columns[]` | `key` / `label` / `align` / `highlight` / `higher_is_better` / `decimals` / `unit` / `delta_unit` | 表格列定义；`higher_is_better` 同时决定最优方向与 Δ 色调 |
-| `rows[]` | `id` / `cells` / `is_baseline` / `emphasis` / `divider_before` / `details` / `files` | 单元格可写原始值，或 `{value, display, note, status}` 对象 |
+| `columns[]` | `key` / `label` / `align` / `highlight` / `higher_is_better` / `decimals` / `unit` / `delta_unit` / `bar` / `max` | 表格列定义；`higher_is_better` 同时决定最优方向与 Δ 色调；`bar: true` 时该列渲染行内进度条，`max` 为满格值（缺省 100） |
+| `rows[]` | `id` / `cells` / `is_baseline` / `emphasis` / `divider_before` / `details` / `files` | 单元格可写原始值，或 `{value, display, note, status, bar, max, sub}` 对象；`sub` 是小字副行，导出只取数值 |
 | `chart_type` | `bar` `line` `scatter` `heatmap` | 图表类型，缺省 `bar` |
 | `scores` | `{维度: 1..5}` | 渲染为进度条，不用写文字形容高低 |
 | `layer` | 整数，从 0 开始 | 缺省时按 edges 拓扑排序自动分层 |
@@ -342,14 +422,14 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `comparison` | 方案卡 + 评分条 + 红绿标签 | 技术选型、方案取舍 |
 | `bento` | Bento 网格，可跨列 | 并列模块/能力总览 |
 | `steps` | 横向阶段进度条 | 迁移步骤、执行计划、排查路径 |
-| `table` | 科研表格：分组表头、最优/次优标记、基准 Δ、搜索排序、LaTeX/Markdown/CSV 导出 | 基准测试、消融实验、参数对照 |
+| `table` | 科研表格：分组表头、最优/次优标记、基准 Δ、行内进度条、搜索排序、LaTeX/Markdown/CSV 导出 | 基准测试、消融实验、参数对照、进度看板 |
 | `chart` | 纯 SVG 柱状 / 折线 / 散点 / 热力，悬停 tooltip、图例开关、帕累托前沿 | 趋势、分布、权衡关系、消融矩阵 |
 | `prose` | Markdown 长文卡片，支持表格与外部链接 | 结论、方法、限制说明 |
 
 科研表格与图表交互（全部离线，无第三方图表库）：
 
 - **双列栅格**：桌面按两列排布，`span: 1` 的 section 并排；分屏或窄屏自动回落单列。
-- **表格**：点表头排序（缺失值永远沉底），搜索框只重绘 `tbody` 不丢焦点；`设为基准` 按钮就地切换 Δ 对比行，点行本身才打开抽屉；`LaTeX` 输出 `booktabs` 的 `\toprule / \midrule / \textbf / \underline / \multicolumn`，`Markdown` 与 `CSV` 按 RFC 4180 转义。剪贴板不可用时，导出内容始终显示在表格下方的预览框里。
+- **表格**：点表头排序（缺失值永远沉底），搜索框只重绘 `tbody` 不丢焦点；`设为基准` 按钮就地切换 Δ 对比行，点行本身才打开抽屉；`bar: true` 的列渲染行内进度条（`max` 满格 + `sub` 小字副行），导出时只取数值；`LaTeX` 输出 `booktabs` 的 `\toprule / \midrule / \textbf / \underline / \multicolumn`，`Markdown` 与 `CSV` 按 RFC 4180 转义。剪贴板不可用时，导出内容始终显示在表格下方的预览框里。
 - **图表**：柱状/折线图例可点击隐藏系列，折线在 `null` 处自动断线；散点可选 `pareto` 前沿并显示标签；热力按 `scale_mode`（`max_good` / `min_good` / `neutral`）着色。`details` / `files` 挂在系列、散点或热力格上即可点击进抽屉。
 - **长文**：`prose` 直接复用 Markdown 渲染与表格包裹逻辑，链接自动 `target="_blank"`。
 
@@ -377,6 +457,12 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `--session` | 会话 ID（默认自动检测，优先级最高） |
 | `--session-name` | 会话显示名，持久化到 `session.json` |
 | `--agent` | 客户端徽标，如 `codex` / `claude` / `antigravity` |
+| `--board` | 实时面板 ID：同一 ID 重复发布即原地更新（不追加回复、不写 `latest.*`） |
+| `--board-name` | 面板显示名（粘性：给过一次后，后续更新不传也保留） |
+| `--project` | 显式项目分组名（对面板与会话都生效） |
+| `--ttl` | 新鲜度窗口（秒）；`0` 或不传表示静态面板 / 不过期 |
+| `--board-status` | 面板状态提示：`ok` / `warn` / `err` / `complete` |
+| `--open-browser` | 面板模式下也强制打开浏览器（回复模式本来就会自动打开） |
 
 缓存结构：
 
@@ -384,14 +470,19 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 ~/.cache/agent-visual-reply/
 ├── .publish.lock                     # 写锁：跨平台排他锁（POSIX flock / Windows msvcrt）
 ├── .server.lock                      # 启动锁：冷启动时串行化 server.py 拉起
-├── state.json                        # {version: 6, seq, latest_session_id, latest_reply_id}
+├── state.json                        # {version: 7, seq, latest_session_id, latest_reply_id}
 ├── sessions/
 │   └── <sid>/
 │       ├── session.json              # label / client / project / pinned / seq / reply_count
 │       └── replies/
 │           ├── 20261114-101500-000001-plan-b.md
 │           └── 20261114-101500-000001-plan-b.md.meta.json
+├── boards/                           # v7 实时面板：每块一个目录，原地覆盖
+│   └── <bid>/
+│       ├── board.json                # label / project / pinned / ttl_sec / status_hint / update_count / seq
+│       └── payload.json | payload.md | payload.html   # 当前载荷，换格式时删除旧扩展名
 ├── global/feed.jsonl                 # 跨会话追加式时间线（seq 单调递增）
+├── global/board_events.jsonl         # 面板事件流（与回复流共享 seq，截断到最近 200 条）
 ├── latest.json | latest.html | latest.md   # v3 兼容投影：当前载荷（按 format 只写其一）
 ├── meta.json                         # v3 兼容投影，额外带 seq / session_id / reply_id
 ├── server.log
@@ -402,6 +493,7 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 ```
 
 `reply_id` 形如 `20261114-101500-000001-plan-b`：时间戳 + 全局序号 + ASCII 片段，天然可排序、可直接拼 URL。
+面板与回复共用 `state.json` 的 `seq`，但事件分开落盘：`/api/feed` 与左栏「全局时间线」只读回复流，面板更新永远不会把时间线刷屏。
 
 ## 服务接口
 
@@ -413,12 +505,16 @@ python3 ${SKILL_DIR}/scripts/publish.py \
 | `GET /api/history/<filename>` | `{format, title, content, updated_at, mtime}` |
 | `GET /artifact/latest` | 当前 HTML Artifact 原文，`text/html; charset=utf-8`；非 html 格式返回 404 |
 | `GET /artifact/history/<filename>` | 历史 HTML Artifact 原文 |
-| `GET /api/sessions` | `{version, seq, latest_session_id, sessions: [...], legacy_count}`，置顶优先、seq 倒序 |
+| `GET /api/sessions` | `{version, seq, latest_session_id, sessions: [...], boards: [...], legacy_count}`，会话与面板各自置顶优先、seq 倒序 |
 | `GET /api/sessions/<sid>/replies?limit=200` | 该会话的回复轮次，最新在前 |
 | `GET /api/sessions/<sid>/replies/<rid>` | `{version, session, reply, content}` |
-| `GET /api/feed?limit=50` | 跨会话全局时间线（含 v3 遗留归档） |
-| `GET /api/state?since=<seq>` | 增量事件，供断线补播 |
-| `GET /api/events` | SSE 实时推送（`text/event-stream`） |
+| `GET /api/boards` | `{version, seq, boards: [...], count}`，面板元数据列表 |
+| `GET /api/boards/<bid>` | `{version, board, content}`；非法 ID 400，不存在 404 |
+| `POST /api/boards/<bid>` | 更新 `{label, pinned}`；非法 ID 400，不存在 404 |
+| `GET /artifact/board/<bid>` | 面板 HTML 原文，`text/html; charset=utf-8`；非 html 格式 404 |
+| `GET /api/feed?limit=50` | 跨会话全局时间线（含 v3 遗留归档；不含面板更新） |
+| `GET /api/state?since=<seq>` | 增量事件（回复 + 面板按 seq 合并），供断线补播 |
+| `GET /api/events` | SSE 实时推送（`text/event-stream`）；回复发 `event: reply`，面板发 `event: board` |
 | `POST /api/notify` | 发布后唤醒 SSE，`{seq, session_id, reply_id, title, format}` |
 | `POST /api/sessions/<sid>` | 更新 `{label, pinned}`，原子写入 |
 | `GET /artifact/session/<sid>/<rid>` | 会话回复的 HTML 原文 |
@@ -443,6 +539,8 @@ python3 ${SKILL_DIR}/scripts/server.py --port 18765
 - **新回复没自动出现**：先看右上角状态点；SSE 断线时会自动降级为 3 秒轮询，状态点显示「实时断线，轮询中」。
 - **会话被拆成好几个**：Agent 每次调用可能换了父进程或终端；用 `--session` 或 `--session-name` 固定，或在会话卡片上重命名（重命名不改 ID）。
 - **发布跑到别的会话里**：检查环境变量里是否残留 `CODEX_THREAD_ID` / `CLAUDE_SESSION_ID` 等；显式 `--session` 永远优先。
+- **面板一直 OFFLINE / 不更新**：确认每轮心跳都带同一个 `--board`，且 `--ttl` 不短于心跳间隔的两倍；状态色点与相对时间每 5 秒本地重算。
+- **面板更新把主窗格刷掉了**：正常不会发生——焦点锁下只有正在看该面板的窗格才会原地重绘；若被 `?mode=global` 切成跟随全局，切回 `锁定会话` 即可。
 
 ## 自检
 
@@ -452,4 +550,4 @@ python3 ${SKILL_DIR}/scripts/server.py --port 18765
 python3 ${SKILL_DIR}/scripts/test_visual_reply.py
 ```
 
-覆盖：md/json/html 发布、auto 识别、八类画布组件元数据、前端组件存在性、artifact 接口、混合历史排序、路径穿越防护、旧版服务接管升级，6 列回环拓扑的几何断言（用本机 `node` 跑 `PAGE_HTML` 里的纯几何核心，校验越界、穿模、列间距、标签叠字）；v4 追加多会话自动检测与深链回执、8 进程并发写入（seq 单调、零丢回复、sidecar 全可解析）、SSE 实时推送 / 增量补播 / 挂连接 SIGTERM 1.5s 内退出、会话置顶重命名与路径穿越、表格/图表纯核心（Node VM：排名、Δ 方向、缺失值沉底、LaTeX 转义、niceScale、断线分段、帕累托前沿、热力归一化）、v6 科研画布端到端发布与 table/chart/prose 简写识别，以及工作台前端标记与「渲染逻辑只有一份」的结构断言。没有 `node` 时会跳过几何与核心用例并明确报出。另含开源卫生检查：公开文件不得出现本机主目录、私人项目名或作者 handle（README/LICENSE 的安装与署名除外），并校验文档互链、`.gitignore` 与 CI 配置。
+覆盖：md/json/html 发布、auto 识别、八类画布组件元数据、前端组件存在性、artifact 接口、混合历史排序、路径穿越防护、旧版服务接管升级，6 列回环拓扑的几何断言（用本机 `node` 跑 `PAGE_HTML` 里的纯几何核心，校验越界、穿模、列间距、标签叠字）；v4 追加多会话自动检测与深链回执、8 进程并发写入（seq 单调、零丢回复、sidecar 全可解析）、SSE 实时推送 / 增量补播 / 挂连接 SIGTERM 1.5s 内退出、会话置顶重命名与路径穿越、表格/图表纯核心（Node VM：排名、Δ 方向、缺失值沉底、LaTeX 转义、niceScale、断线分段、帕累托前沿、热力归一化）、v6 科研画布端到端发布与 table/chart/prose 简写识别，以及工作台前端标记与「渲染逻辑只有一份」的结构断言；v7 追加面板健康度状态机与时间格式、面板感知的目录树（置顶 / 项目分组 / 未读筛选 / 置顶面板不重复计数）、行内表格进度条（`bar` / `max` / `sub` 与纯数值导出）、面板幂等更新与回复流隔离（不写 `latest.*` / `meta.json` / `history/` / `feed.jsonl`）、`/api/boards` 系列接口与 `event: board` SSE、HTML 面板 artifact 与路径穿越防护。没有 `node` 时会跳过几何与核心用例并明确报出。另含开源卫生检查：公开文件不得出现本机主目录、私人项目名或作者 handle（README/LICENSE 的安装与署名除外），并校验文档互链、`.gitignore` 与 CI 配置。

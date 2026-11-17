@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""visual-reply v6 共享存储层（纯标准库）。
+"""visual-reply v7 共享存储层（纯标准库）。
 
 职责：
     1. 跨平台进程锁：`<cache>/.publish.lock`
        POSIX 用 fcntl.flock，Windows 用 msvcrt.locking（先保证文件至少 1 字节）；
     2. 会话识别：显式 --session > 环境变量 > 终端复用器 > 父进程兜底；
     3. 回复归档：sessions/<sid>/replies/<reply_id>.<ext> + sidecar，
-       同时维护 state.json、global/feed.jsonl 与 v3 的 latest/meta/history 投影。
+       同时维护 state.json、global/feed.jsonl 与 v3 的 latest/meta/history 投影；
+    4. 实时面板（Live Board）：boards/<board_id>/payload.<ext> + board.json，
+       只写 state.json 的 seq 与 global/board_events.jsonl，
+       刻意不碰 latest.* / meta.json / history/ / sessions/ / feed.jsonl。
 
 publish.py 与 server.py 都把脚本目录插入 sys.path 后 `import vr_store`，
 因此直接执行与 importlib 按路径加载都能工作。本文件只依赖标准库。
@@ -23,10 +26,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-STORE_VERSION = 6
+STORE_VERSION = 7
 
 FORMAT_EXT = {"json": ".json", "html": ".html", "md": ".md"}
 EXT_FORMAT = {".json": "json", ".html": "html", ".md": "md"}
+
+#: global/board_events.jsonl 的保留上限：心跳式刷新永远不会把磁盘撑爆。
+BOARD_EVENTS_LIMIT = 200
 
 #: 会话色板（前端左侧栏强调条），由 session_id 的 sha256 决定下标。
 SESSION_COLORS = (
@@ -266,14 +272,20 @@ def resolve_session(explicit_session: str | None = None,
                     session_name: str | None = None,
                     agent: str | None = None,
                     env=None,
-                    cwd: Path | str | None = None) -> dict:
+                    cwd: Path | str | None = None,
+                    explicit_project: str | None = None) -> dict:
     """零配置会话解析。
 
     优先级：显式 --session > VISUAL_REPLY_SESSION > Agent 客户端环境变量 >
     终端复用器 > sha256(ppid|项目根)。返回的 dict 可直接交给 commit_reply()。
+    `explicit_project` 非空时覆盖自动探测的项目名（默认 label 前缀随之切换）。
     """
     environment = os.environ if env is None else env
     project, project_root = detect_project(cwd)
+
+    override = (explicit_project or "").strip()
+    if override:
+        project = override[:60].strip() or project
 
     session_id = ""
     client = (agent or "").strip()
@@ -418,6 +430,21 @@ def replies_root(cache_dir: Path | str, session_id: str) -> Path:
     return session_dir(cache_dir, session_id) / "replies"
 
 
+def boards_root(cache_dir: Path | str) -> Path:
+    return Path(cache_dir) / "boards"
+
+
+def board_dir(cache_dir: Path | str, board_id: str) -> Path:
+    """带 containment 校验的面板目录；非法 ID 直接抛 ValueError。"""
+    if not is_safe_id(board_id):
+        raise ValueError("非法的面板 ID")
+    base = boards_root(cache_dir).resolve()
+    target = (base / board_id).resolve()
+    if target.parent != base:
+        raise ValueError("面板 ID 越出缓存目录")
+    return target
+
+
 def read_state(cache_dir: Path | str) -> dict:
     data = read_json(Path(cache_dir) / "state.json", {})
     if not isinstance(data, dict):
@@ -431,6 +458,7 @@ def read_state(cache_dir: Path | str) -> dict:
         "seq": seq,
         "latest_session_id": data.get("latest_session_id") or "",
         "latest_reply_id": data.get("latest_reply_id") or "",
+        "latest_board_id": data.get("latest_board_id") or "",
         "updated_at": data.get("updated_at") or "",
     }
 
@@ -613,11 +641,36 @@ def feed_items(cache_dir: Path | str, limit: int = 50) -> list[dict]:
 
 
 def state_events(cache_dir: Path | str, since: int = 0, limit: int = 200) -> list[dict]:
-    """返回 seq > since 的事件，按 seq 升序，便于前端顺序补播。"""
+    """返回 seq > since 的事件，按 seq 升序，便于前端顺序补播。
+
+    回复事件读 global/feed.jsonl，面板事件单独读 global/board_events.jsonl；
+    两条流合并后统一排序，`feed_items()` 仍然只看回复流（全局时间线保持干净）。
+    """
     rows = feed_items(cache_dir, limit=max(limit * 2, 200))
-    picked = [row for row in rows if int(row.get("seq") or 0) > int(since or 0)]
+    for row in rows:
+        if not row.get("event_type"):
+            row["event_type"] = "reply"
+
+    board_path = Path(cache_dir) / "global" / "board_events.jsonl"
+    board_rows: list[dict] = []
+    if board_path.is_file():
+        for line in _tail_lines(board_path, max(limit, 1) * 2):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("event_type") == "board" and data.get("seq") is not None:
+                board_rows.append(data)
+
+    cutoff = int(since or 0)
+    picked = [row for row in rows + board_rows if int(row.get("seq") or 0) > cutoff]
     picked.sort(key=lambda row: int(row.get("seq") or 0))
-    return picked[-limit:] if limit else picked
+    return picked[-limit:] if limit and limit > 0 else picked
 
 
 def legacy_history_files(cache_dir: Path | str) -> list[Path]:
@@ -658,6 +711,228 @@ def update_session(cache_dir: Path | str, session_id: str,
     record["updated_at"] = iso_time(time.time())
     atomic_write_json(session_dir(cache_dir, session_id) / "session.json", record)
     return record
+
+
+# ---------------------------------------------------------------------------
+# 实时面板（Live Board）
+# ---------------------------------------------------------------------------
+
+
+def board_event(record: dict) -> dict:
+    """把 board.json 记录压成一条 SSE / 轮询都能直接消费的事件。"""
+    return {
+        "event_type": "board",
+        "seq": int(record.get("seq") or 0),
+        "board_id": str(record.get("id") or ""),
+        "board_label": str(record.get("label") or ""),
+        "project": str(record.get("project") or ""),
+        "format": str(record.get("format") or "md"),
+        "title": str(record.get("title") or ""),
+        "chars": int(record.get("chars") or 0),
+        "ttl_sec": int(record.get("ttl_sec") or 0),
+        "status_hint": str(record.get("status_hint") or ""),
+        "update_count": int(record.get("update_count") or 0),
+        "updated_at": str(record.get("updated_at") or ""),
+        "updated_epoch": float(record.get("updated_epoch") or 0.0),
+    }
+
+
+def _cap_jsonl(path: Path, limit: int = BOARD_EVENTS_LIMIT) -> None:
+    """把 JSONL 截到最近 limit 行；未超限时不做任何 IO 之外的改动。"""
+    lines = _tail_lines(path, limit + 1)
+    if len(lines) <= limit:
+        return
+    atomic_write_text(path, "\n".join(lines[-limit:]) + "\n")
+
+
+def list_boards(cache_dir: Path | str) -> list[dict]:
+    root = boards_root(cache_dir)
+    items: list[dict] = []
+    if not root.is_dir():
+        return items
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return items
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        data = read_json(entry / "board.json", None)
+        if isinstance(data, dict) and data.get("id"):
+            items.append(data)
+    items.sort(key=_session_sort_key, reverse=True)
+    return items
+
+
+def read_board(cache_dir: Path | str, board_id: str) -> dict | None:
+    """读取面板元数据与当前载荷，返回 {"board": meta, "content": text}。"""
+    try:
+        bdir = board_dir(cache_dir, board_id)
+    except ValueError:
+        return None
+    meta = read_json(bdir / "board.json", None)
+    if not isinstance(meta, dict) or not meta.get("id"):
+        return None
+    payload: Path | None = None
+    name = meta.get("payload_file")
+    if isinstance(name, str) and name:
+        candidate = (bdir / Path(name).name).resolve()
+        if candidate.parent == bdir.resolve() and candidate.is_file():
+            payload = candidate
+    if payload is None:
+        for ext in FORMAT_EXT.values():
+            candidate = bdir / f"payload{ext}"
+            if candidate.is_file():
+                payload = candidate
+                break
+    if payload is None:
+        return None
+    try:
+        content = payload.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return {"board": meta, "content": content}
+
+
+def update_board(cache_dir: Path | str, board_id: str,
+                 label: str | None = None, pinned: bool | None = None) -> dict | None:
+    """更新面板的展示元数据（label / pinned）；调用方需持有 cache_lock。
+
+    刻意不动 updated_at / updated_epoch：改名或置顶不应该把离线面板伪装成新鲜。
+    """
+    data = read_board(cache_dir, board_id)
+    if data is None:
+        return None
+    record = dict(data["board"])
+    if label is not None:
+        text = str(label).strip()[:60]
+        if text:
+            record["label"] = text
+            record["custom_label"] = True
+    if pinned is not None:
+        record["pinned"] = bool(pinned)
+    atomic_write_json(board_dir(cache_dir, board_id) / "board.json", record)
+    return record
+
+
+def upsert_board(cache_dir: Path | str,
+                 board_meta: dict,
+                 content: str,
+                 fmt: str,
+                 title: str,
+                 ttl_sec: int = 0,
+                 status_hint: str = "") -> dict:
+    """幂等写入一块实时面板；调用方需持有 cache_lock。
+
+    与 commit_reply() 的关键差异：只递增 state.json 的 seq、只追加
+    global/board_events.jsonl，不写 latest.* / meta.json / history/ / sessions/，
+    也不动 latest_session_id / latest_reply_id —— 心跳面板永远不会污染回复流。
+    """
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+
+    board_id = str((board_meta or {}).get("id") or "")
+    if not is_safe_id(board_id):
+        raise ValueError("非法的面板 ID")
+    bdir = board_dir(cache, board_id)
+    bdir.mkdir(parents=True, exist_ok=True)
+    ext = FORMAT_EXT.get(fmt, ".md")
+
+    previous = read_json(bdir / "board.json", {})
+    if not isinstance(previous, dict):
+        previous = {}
+
+    state = read_state(cache)
+    seq = int(state.get("seq") or 0) + 1
+    now = iso_time(time.time())
+
+    payload = bdir / f"payload{ext}"
+    atomic_write_text(payload, content)
+    mtime = payload.stat().st_mtime
+    for other_ext in FORMAT_EXT.values():
+        if other_ext == ext:
+            continue
+        stale = bdir / f"payload{other_ext}"
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+    # 粘性标题：--board-name 一旦给过，后续不传也保留；未自定义时跟随默认 label。
+    label = str(board_meta.get("label") or "").strip()
+    custom_label = bool(board_meta.get("custom_label")) and bool(label)
+    if custom_label:
+        label = label[:60]
+    elif previous.get("custom_label") and previous.get("label"):
+        label = str(previous["label"])
+        custom_label = True
+    else:
+        label = (label or str(previous.get("label") or board_id))[:60]
+        custom_label = False
+
+    created_at = previous.get("created_at") or now
+    raw_created_seq = previous.get("created_seq")
+    if (isinstance(raw_created_seq, int) and not isinstance(raw_created_seq, bool)
+            and raw_created_seq > 0):
+        created_seq = raw_created_seq
+    else:
+        created_seq = seq
+    update_count = int(previous.get("update_count") or 0) + 1
+    try:
+        ttl_value = max(0, int(ttl_sec or 0))
+    except (TypeError, ValueError):
+        ttl_value = 0
+
+    record = {
+        "id": board_id,
+        "kind": "board",
+        "label": label,
+        "custom_label": custom_label,
+        "project": str(board_meta.get("project") or "workspace"),
+        "client": str(board_meta.get("client") or "agent"),
+        "color": SESSION_COLORS[color_index(board_id)],
+        "pinned": bool(previous.get("pinned")),
+        "format": fmt,
+        "payload_file": payload.name,
+        "title": title,
+        "chars": len(content),
+        "ttl_sec": ttl_value,
+        "status_hint": str(status_hint or ""),
+        "update_count": update_count,
+        "seq": seq,
+        "created_at": created_at,
+        "created_seq": created_seq,
+        "updated_at": iso_time(mtime),
+        "updated_epoch": float(mtime),
+    }
+    atomic_write_json(bdir / "board.json", record)
+
+    write_state(cache, {
+        "version": STORE_VERSION,
+        "seq": seq,
+        "latest_session_id": state.get("latest_session_id") or "",
+        "latest_reply_id": state.get("latest_reply_id") or "",
+        "latest_board_id": board_id,
+        "updated_at": now,
+    })
+
+    event = board_event(record)
+    events_path = cache / "global" / "board_events.jsonl"
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(events_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    _cap_jsonl(events_path, BOARD_EVENTS_LIMIT)
+
+    return {
+        "seq": seq,
+        "board": record,
+        "event": event,
+        "board_file": str(payload),
+        "board_meta": str(bdir / "board.json"),
+        "mtime": mtime,
+        "chars": len(content),
+    }
 
 
 # ---------------------------------------------------------------------------

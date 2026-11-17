@@ -10,6 +10,7 @@ Visual Reply 是一个面向终端 / CLI 编码 Agent 的 Skill。它不再把�
 scrollback，而是把结构化载荷发布到 `http://127.0.0.1:18765`，终端里只留一句结论和一个链接。
 图表、拓扑图和评分卡在浏览器里渲染，所有长解释默认折叠进右侧抽屉，点开才展开。
 同时开几个 Agent 也不打架：每个会话在同一个页面里各占一条泳道。
+长任务还可以发布**实时面板**：同一个 ID 反复刷新，不刷屏、不占回复历史。
 
 只依赖 Python 3.10+ 标准库。不需要 pip 安装，不需要 API Key，不上报任何数据，自身也不发起网络请求。
 
@@ -53,7 +54,7 @@ Visual Reply 强制两级信息密度：**首屏不出现长句**——只有数
 | `comparison` | 方案卡 + 1–5 评分条 | 技术选型、方案取舍 |
 | `bento` | Bento 网格，卡片可跨列 | 并列模块 / 能力总览 |
 | `steps` | 横向阶段进度条 | 迁移步骤、执行计划、排查路径 |
-| `table` | 科研表格：分组表头、最优/次优标记、基准 Δ、搜索排序、LaTeX / Markdown / CSV 导出 | 基准测试、消融实验、参数对照 |
+| `table` | 科研表格：分组表头、最优/次优标记、基准 Δ、行内进度条、搜索排序、LaTeX / Markdown / CSV 导出 | 基准测试、消融实验、参数对照、进度看板 |
 | `chart` | 纯 SVG 柱状 / 折线 / 散点 / 热力，tooltip、图例开关、帕累托前沿 | 趋势、分布、权衡关系、消融矩阵 |
 | `prose` | Markdown 长文卡片，支持表格与外部链接 | 结论、方法、限制说明 |
 
@@ -109,6 +110,57 @@ Inspector 抽屉里展开完整说明、代码块和文件清单；`Esc` 或 `×
 
 深链：`?session=<sid>&reply=<rid>`，可选 `&split=<sid2>`、`&layout=h|v`、`&mode=lock|global`。
 发布回执里的 `url` 本身就是这样一条深链。
+
+### 实时面板（Live Board）
+
+不是所有回答都是一次性回复。训练进度、CI 构建、长任务心跳——这些要的是**一块持续刷新的看板**，
+而不是二十条归档。加上 `--board` 后，同一 ID 的每次发布都会原地覆盖同一块面板：
+
+```bash
+# 第一次发布：创建面板
+python3 scripts/publish.py --title "构建状态" --stdin \
+  --board ci-live --board-name "CI 构建" --project "发布" --ttl 120 <<'JSON'
+{
+  "headline": "build 4821 · 3/5 阶段通过",
+  "sections": [
+    { "type": "table",
+      "columns": [
+        { "key": "stage", "label": "阶段" },
+        { "key": "progress", "label": "进度", "bar": true, "max": 100, "unit": "%" },
+        { "key": "tests", "label": "用例", "decimals": 0 }
+      ],
+      "rows": [
+        { "id": "lint", "stage": "lint", "progress": { "value": 100, "sub": "done", "status": "ok" }, "tests": 0 },
+        { "id": "unit", "stage": "unit", "progress": { "value": 78, "sub": "1402/1798" }, "tests": 1402 }
+      ] }
+  ]
+}
+JSON
+
+# 之后每轮心跳：同一个 --board，换内容
+python3 scripts/publish.py --title "构建状态" --stdin \
+  --board ci-live --ttl 120 <<'JSON'
+{ "headline": "build 4821 · 4/5 阶段通过", "sections": [ … ] }
+JSON
+```
+
+- **与回复流隔离**：面板永远不写 `latest.*`、`meta.json`、`history/`、`sessions/` 和回复时间线，
+  既不会污染全局动态，也不可能劫持窗格。回复与面板共用 `state.json` 的 `seq`，但事件分开落盘，
+  SSE 帧分别标记为 `event: reply` 与 `event: board`。
+- **标题粘性**：自定义 `--board-name` 首次给过就持久化，后续心跳只需要 ID 和载荷；
+  `--project` 每次发布生效（缺省取会话项目）。
+- **健康度状态机**：给了 `--ttl <秒>` 后，左栏卡片与窗格标题会按面板年龄推导状态：
+  `LIVE`（age ≤ ttl）/ `STALE`（ttl < age ≤ 2×ttl）/ `OFFLINE`（更旧）；
+  `--board-status complete` 固定为 `DONE`，`--board-status err` 固定为 `ALERT`；
+  无 TTL 的面板显示 `BOARD`，带 `warn` 提示时显示 `WARN`。相对时间每 5 秒本地重算，不发请求。
+- **左栏卡片**：面板与会话共用置顶 / 项目分组，卡片上带健康色点、`📊`、更新次数和相对时间；
+  悬停出现 `★/☆` 置顶、`改` 重命名、`◫` 分屏；分屏目标列表里单独有「实时面板」分组。
+- **原地刷新**：收到 `event: board` 时，只有正在看这块面板的窗格才重绘，滚动位置、表格排序 /
+  搜索 / 基准 Δ、图表隐藏系列、拓扑缩放和已打开的 Inspector 抽屉全部保留；其它窗格只更新色点。
+- **行内进度条**：列或单元格写 `"bar": true` 渲染进度条，`max` 为满格值，`sub` 显示小字副行；
+  导出 LaTeX / Markdown / CSV 时只取数值。
+- **深链**：`?board=<bid>` 聚焦面板，`?split=board:<bid>` 在右窗格分屏；面板回执里的 `url`
+  已经带 `?board=`。
 
 ### 实时无刷更新
 
@@ -285,8 +337,8 @@ python3 scripts/server.py --port 18765
 | `tone`（card） | `accent` `ok` `warn` `err` | Bento 卡片描边与强调色 |
 | `span`（card） | `1` `2` | 4 列栅格中的列宽 |
 | `span`（section） | `1` `2` | 两列栅格中占 1 列或整行；分屏 / 窄屏回落整行 |
-| `columns[]` | `key` / `label` / `align` / `highlight` / `higher_is_better` / `decimals` / `unit` / `delta_unit` | 表格列定义；`higher_is_better` 决定最优方向与 Δ 色调 |
-| `rows[]` | `id` / `cells` / `is_baseline` / `emphasis` / `divider_before` / `details` / `files` | 单元格可写原始值，或 `{value, display, note, status}` |
+| `columns[]` | `key` / `label` / `align` / `highlight` / `higher_is_better` / `decimals` / `unit` / `delta_unit` / `bar` / `max` | 表格列定义；`higher_is_better` 决定最优方向与 Δ 色调；`bar: true` 渲染行内进度条，`max` 为满格值 |
+| `rows[]` | `id` / `cells` / `is_baseline` / `emphasis` / `divider_before` / `details` / `files` | 单元格可写原始值，或 `{value, display, note, status, bar, max, sub}`；`sub` 为小字副行，导出只取数值 |
 | `chart_type` | `bar` `line` `scatter` `heatmap` | 图表类型，缺省 `bar` |
 | `scores` | `{ "维度": 1..5 }` | 渲染成进度条，不要再写文字形容高低 |
 | `layer` | 从 0 开始的整数 | 缺省时按 edges 拓扑排序自动分层 |
@@ -317,6 +369,12 @@ python3 scripts/server.py --port 18765
 | `--session` | 会话 ID，显式指定后跳过自动检测；非法 ID 直接拒绝 |
 | `--session-name` | 会话显示名，持久化到 `session.json` |
 | `--agent` | 客户端徽标（`codex` / `claude` / `antigravity` …） |
+| `--board` | 实时面板 ID；同一 ID 重复发布原地更新，不再追加回复 |
+| `--board-name` | 面板显示名（粘性：首次给过后，后续更新不传也保留） |
+| `--project` | 显式项目分组名（对面板与会话都生效） |
+| `--ttl` | 新鲜度窗口（秒）；`0`（默认）表示静态面板 / 不过期 |
+| `--board-status` | 可选状态提示：`ok` / `warn` / `err` / `complete` |
+| `--open-browser` | 面板模式下也强制打开浏览器（回复模式本来就会打开） |
 
 缓存结构：
 
@@ -324,14 +382,19 @@ python3 scripts/server.py --port 18765
 ~/.cache/agent-visual-reply/
 ├── .publish.lock                          # 写锁：跨平台排他锁（flock / msvcrt.locking）
 ├── .server.lock                           # 启动锁：冷启动串行化
-├── state.json                             # version / seq / 最新会话与回复指针
+├── state.json                             # version 7 / seq / 最新会话与回复指针
 ├── sessions/
 │   └── <sid>/
 │       ├── session.json                   # label / client / project / pinned / seq / reply_count
 │       └── replies/
 │           ├── 20260101-120000-000001-标题.md
 │           └── 20260101-120000-000001-标题.md.meta.json
-├── global/feed.jsonl                      # 追加式跨会话时间线
+├── boards/                                # v7 实时面板：每块面板一个目录
+│   └── <bid>/
+│       ├── board.json                     # label / project / pinned / ttl_sec / status_hint / update_count / seq
+│       └── payload.json | .md | .html     # 原地覆盖；切换格式时删除旧扩展名
+├── global/feed.jsonl                      # 追加式跨会话回复时间线
+├── global/board_events.jsonl              # 面板事件流，截断到最近 200 条
 ├── latest.json | latest.html | latest.md  # v3 投影，按格式只写其一
 ├── meta.json                              # v3 投影，额外带 seq / session_id / reply_id
 ├── server.log
@@ -342,6 +405,7 @@ python3 scripts/server.py --port 18765
 ```
 
 `reply_id` 形如 `<时间戳>-<seq:06d>-<ASCII 片段>`：可排序、并发下唯一、可直接拼进 URL。
+回复与面板共用 `state.json` 的 `seq`，但事件分开落盘：`/api/feed` 与左栏时间线永远不含面板刷新。
 
 ---
 
@@ -355,12 +419,16 @@ python3 scripts/server.py --port 18765
 | `GET /api/history/<filename>` | `{format, title, content, updated_at, mtime}` |
 | `GET /artifact/latest` | 当前 HTML Artifact 原文，`text/html; charset=utf-8`；非 html 格式返回 404 |
 | `GET /artifact/history/<filename>` | 历史 HTML Artifact 原文 |
-| `GET /api/sessions` | `{version, seq, latest_session_id, sessions, legacy_count}`，置顶优先、其后按新到旧 |
+| `GET /api/sessions` | `{version, seq, latest_session_id, sessions, boards, legacy_count}`，置顶优先、其后按新到旧 |
 | `GET /api/sessions/<sid>/replies?limit=200` | 某会话的回复轮次，最新在前 |
 | `GET /api/sessions/<sid>/replies/<rid>` | `{version, session, reply, content}` |
-| `GET /api/feed?limit=50` | 跨会话全局时间线（含未归入会话的 v3 归档） |
-| `GET /api/state?since=<seq>` | 断线补播的增量事件 |
-| `GET /api/events` | SSE 流（`text/event-stream`，20 秒 keepalive） |
+| `GET /api/boards` | `{version, seq, boards, count}` |
+| `GET /api/boards/<bid>` | `{version, board, content}`；非法 ID 400，不存在 404 |
+| `POST /api/boards/<bid>` | 更新 `{label, pinned}`；400 / 404 同上 |
+| `GET /artifact/board/<bid>` | 面板 HTML 原文，`text/html; charset=utf-8`；非 html 格式 404 |
+| `GET /api/feed?limit=50` | 跨会话回复时间线（含未归入会话的 v3 归档，不含面板刷新） |
+| `GET /api/state?since=<seq>` | 断线补播的增量事件（回复 + 面板按 seq 合并） |
+| `GET /api/events` | SSE 流（`text/event-stream`，20 秒 keepalive）；回复发 `event: reply`，面板发 `event: board` |
 | `POST /api/notify` | 发布后立即唤醒 SSE |
 | `POST /api/sessions/<sid>` | 原子更新 `{label, pinned}` |
 | `GET /artifact/session/<sid>/<rid>` | 会话回复的 HTML 原文 |
@@ -388,6 +456,13 @@ v6 追加：Node VM 里的 `TableCore`（并列排名、双向 Δ、缺失值沉
 RFC 4180 CSV）与 `ChartCore`（常规/负数/常量/空区间刻度、柱体边界、null 断线、隐藏系列、
 帕累托前沿、热力归一化），以及完整科研画布的发布 / 回读与 table/chart/prose 简写识别。
 
+v7 追加：Node VM 里的面板健康度状态机与相对时间格式（全部分支、TTL 边界、epoch / ISO
+时间戳、`刚刚` / `s` / `m` / `h` 格式）；面板感知的目录树（置顶面板、纯面板项目分组、
+未读筛选、置顶面板不重复计数）；行内表格进度条（`bar` / `max` / `sub` 解析与纯数值导出）；
+幂等面板发布回读，证明回复侧完全不受影响（`latest.*` / `meta.json` / `history/` / 回复流
+均不变）；`/api/boards` 列表 / 读取 / 置顶重命名接口；`/api/boards/..` 与
+`/artifact/board/..` 路径穿越拒绝；`event: board` SSE 推送；HTML 面板 artifact 路由。
+
 不需要联网。
 
 ---
@@ -407,6 +482,8 @@ RFC 4180 CSV）与 `ChartCore`（常规/负数/常量/空区间刻度、柱体�
 | 新回复没有自动出现 | 状态点显示「实时断线」时说明 SSE 被挡，3 秒轮询会自动接管 |
 | 一个 Agent 变成好几个会话 | 父进程或终端面板变了；用 `--session` / `--session-name` 固定 |
 | 发布跑到别的会话里 | 环境里残留了 `CODEX_THREAD_ID`、`CLAUDE_SESSION_ID` 等；`--session` 永远优先 |
+| 面板一直是 `OFFLINE` | 每轮心跳要带同一个 `--board`，且 `--ttl` 至少是心跳间隔的两倍 |
+| 面板更新把你正在读的窗格刷掉了 | 正常不会：焦点锁下只有正在看该面板的窗格才原地重绘；若切到了 `跟随全局`，切回 `锁定会话` |
 
 ---
 

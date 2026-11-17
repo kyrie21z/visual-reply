@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""visual-reply 本地预览服务 v6（纯标准库，多会话工作台）。
+"""visual-reply 本地预览服务 v7（纯标准库，多会话工作台 + 实时面板）。
 
 三种渲染模式：
     md     兼容模式：阅读 / 脑图 / 分屏
@@ -8,21 +8,25 @@
     html   HTML Artifact 沙箱：iframe 渲染 + 源码查看
 
 接口：
-    GET  /                                  单页 HTML（多会话工作台）
+    GET  /                                  单页 HTML（多会话工作台 + 实时面板）
     GET  /api/latest                        最新内容 {version, format, title, content, mtime, updated_at}
     GET  /api/history                       最近 20 条历史（v3 投影）
     GET  /api/history/<file>                单条历史
-    GET  /api/sessions                      会话列表（置顶优先，seq 倒序）
+    GET  /api/sessions                      会话列表（置顶优先，seq 倒序）+ boards
     GET  /api/sessions/<sid>/replies        某会话的回复轮次（最新在前）
     GET  /api/sessions/<sid>/replies/<rid>  单条回复（含正文）
-    GET  /api/feed?limit=50                 跨会话全局时间线
-    GET  /api/state?since=<seq>             增量补播事件
-    GET  /api/events                        SSE 实时推送
+    GET  /api/boards                        实时面板列表（置顶优先，seq 倒序）
+    GET  /api/boards/<bid>                  单块面板（含正文）
+    GET  /api/feed?limit=50                 跨会话全局时间线（只含回复，不含面板）
+    GET  /api/state?since=<seq>             增量补播事件（回复 + 面板）
+    GET  /api/events                        SSE 实时推送（event: reply / board）
     POST /api/notify                        唤醒 SSE（发布后立即刷新）
     POST /api/sessions/<sid>                更新 label / pinned
+    POST /api/boards/<bid>                  更新面板 label / pinned
     GET  /artifact/latest                   HTML 原文（供 iframe 加载）
     GET  /artifact/history/<file>           历史 HTML 原文
     GET  /artifact/session/<sid>/<rid>      会话回复的 HTML 原文
+    GET  /artifact/board/<bid>              面板的 HTML 原文
     GET  /healthz                           健康检查（含 version）
 """
 
@@ -49,7 +53,7 @@ import vr_store  # noqa: E402  - 保证按路径加载时也能 import
 DEFAULT_PORT = 18765
 DEFAULT_CACHE_DIR = Path("~/.cache/agent-visual-reply").expanduser()
 SERVICE_NAME = "visual-reply"
-VERSION = 6
+VERSION = 7
 HISTORY_LIMIT = 20
 REPLY_LIMIT = 200
 FEED_LIMIT = 50
@@ -458,6 +462,9 @@ body.mode-html #canvas-pane { display: none !important; }
 .tbl-delta[data-tone="neg"] { color: var(--err); }
 .tbl-delta[data-tone="zero"] { color: var(--fg-muted); }
 .tbl-cell-note { border-bottom: 1px dotted var(--fg-muted); cursor: help; }
+.tbl-meter { height: 4px; margin-top: 4px; border-radius: 999px; background: var(--border); overflow: hidden; min-width: 46px; }
+.tbl-meter > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--ok)); }
+.tbl-sub { margin-top: 2px; font-size: 10px; line-height: 1.25; color: var(--fg-muted); }
 .tbl-note { padding: 9px 12px; border-top: 1px solid var(--border); font-size: 11.5px; color: var(--fg-muted); line-height: 1.55; }
 .tbl-empty { padding: 26px 12px; text-align: center; color: var(--fg-muted); font-size: 12.5px; }
 .tbl-export-box { border-top: 1px solid var(--border); background: var(--bg-soft); }
@@ -617,6 +624,46 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 .rail-actions { position: absolute; right: 6px; bottom: 5px; display: none; gap: 2px; }
 .rail-card:hover .rail-actions { display: flex; }
 .rail-actions button { padding: 1px 6px; font-size: 10.5px; line-height: 1.5; border-radius: 6px; background: var(--bg-elev); }
+.rail-board {
+  position: relative; display: flex; align-items: flex-start; gap: 6px;
+  padding: 7px 9px 7px 10px; border: 1px dashed var(--border-strong); border-radius: 11px;
+  background: var(--bg-elev); cursor: pointer; transition: border-color .15s, background .15s;
+}
+.rail-board:hover { border-color: var(--accent); }
+.rail-board[data-active="true"] {
+  border-style: solid; border-color: var(--accent); background: var(--accent-soft);
+}
+.rail-board:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.rail-board-dot { flex: 0 0 auto; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--fg-muted); }
+.rail-board-dot[data-health="live"] { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent); }
+.rail-board-dot[data-health="stale"] { background: var(--warn); }
+.rail-board-dot[data-health="dead"], .rail-board-dot[data-health="err"] { background: var(--err); }
+.rail-board-dot[data-health="complete"] { background: var(--accent); }
+.rail-board-icon { flex: 0 0 auto; font-size: 11px; line-height: 1.5; }
+.rail-board-main { min-width: 0; flex: 1 1 auto; padding-right: 22px; }
+.rail-board-line { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.rail-board-title { flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rail-board-pill {
+  flex: 0 0 auto; padding: 0 5px; border-radius: 999px; font-size: 9px; font-weight: 650;
+  line-height: 14px; color: var(--fg-muted); background: var(--bg-soft); border: 1px solid var(--border);
+}
+.rail-board-pill[data-health="live"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.rail-board-pill[data-health="stale"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.rail-board-pill[data-health="dead"], .rail-board-pill[data-health="err"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); background: color-mix(in srgb, var(--err) 10%, transparent); }
+.rail-board-pill[data-health="complete"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
+.rail-board-meta { margin-top: 2px; font-size: 10px; color: var(--fg-muted); opacity: .9; }
+.rail-board .rail-actions { display: none; }
+.rail-board:hover .rail-actions { display: flex; }
+.board-status-pill {
+  display: inline-block; margin-right: 2px; padding: 0 6px; border-radius: 999px;
+  font-size: 9.5px; font-weight: 700; letter-spacing: .04em; line-height: 15px;
+  color: var(--fg-muted); background: var(--bg-soft); border: 1px solid var(--border-strong);
+}
+.board-status-pill[data-health="live"] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.board-status-pill[data-health="stale"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.board-status-pill[data-health="dead"], .board-status-pill[data-health="err"] { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, transparent); background: color-mix(in srgb, var(--err) 10%, transparent); }
+.board-status-pill[data-health="complete"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
+.board-status-meta { opacity: .9; }
 .rail-project-pill {
   flex: 0 1 auto; max-width: 88px; padding: 0 6px;
   font-size: 9.5px; font-weight: 600; line-height: 15px; color: var(--fg-muted);
@@ -883,6 +930,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     railView: 'sessions',
     filter: 'all',
     sessions: [],
+    boards: [],
     replies: {},
     globalSeq: 0,
     lastHandledSeq: 0,
@@ -1056,6 +1104,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       artifactSource: $('.pane-artifact-source', root),
       sessionId: '',
       replyId: '',
+      boardId: '',
       viewingHistory: false,
       viewer: {
         mode: 'md', subview: 'reading', format: 'md', title: '', content: '',
@@ -1098,7 +1147,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
   }
 
-  function setMode(pane, mode) {
+  function setMode(pane, mode, opts) {
     var v = pane.viewer;
     var changed = v.mode !== mode;
     v.mode = mode;
@@ -1112,16 +1161,16 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     if (changed) {
       var saved = mode === 'md' ? localStorage.getItem('vr.sub.md') : null;
       v.subview = saved && ids.indexOf(saved) >= 0 ? saved : ids[0];
-      closeDrawer();
+      if (!(opts && opts.keepDrawer)) closeDrawer();
     } else if (ids.indexOf(v.subview) < 0) {
       v.subview = ids[0];
     }
     rebuildViewSwitch(pane);
   }
 
-  function applySubview(pane) {
+  function applySubview(pane, opts) {
     var v = pane.viewer;
-    if (v.mode === 'md' && pane.name === 'primary') closeDrawer();
+    if (!(opts && opts.keepDrawer) && v.mode === 'md' && pane.name === 'primary') closeDrawer();
     $$('button', pane.viewSwitch).forEach(function (btn) {
       btn.dataset.active = String(btn.dataset.view === v.subview);
     });
@@ -1467,12 +1516,18 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }
 
     function parseCell(raw) {
-      var out = { raw: raw, num: null, text: '', note: '', status: '', hasDisplay: false };
+      var out = {
+        raw: raw, num: null, text: '', note: '', status: '', hasDisplay: false,
+        bar: false, max: null, sub: ''
+      };
       if (raw === null || raw === undefined) return out;
       if (typeof raw === 'object') {
         var value = raw.value;
         out.note = raw.note === null || raw.note === undefined ? '' : String(raw.note);
         out.status = raw.status === null || raw.status === undefined ? '' : String(raw.status);
+        out.bar = !!raw.bar;
+        out.max = finite(raw.max);
+        out.sub = raw.sub === null || raw.sub === undefined ? '' : String(raw.sub);
         if (typeof raw.display === 'string') {
           out.hasDisplay = true;
           out.text = raw.display;
@@ -3168,10 +3223,79 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       return String(session.project || 'workspace').trim() || 'workspace';
     }
 
+    function finite(value) {
+      var n = Number(value);
+      return isFinite(n) ? n : null;
+    }
+
+    /* 实时面板健康度：状态提示优先，其次按 TTL 窗口判定新鲜度。 */
+    function computeBoardHealth(board, nowMs) {
+      board = board || {};
+      var epoch = Number(board.updated_epoch);
+      var updatedMs = (epoch > 0 ? epoch * 1000 : Date.parse(board.updated_at || '')) || 0;
+      var now = finite(nowMs) !== null ? Number(nowMs) : Date.now();
+      var ageSec = updatedMs > 0 ? Math.max(0, Math.floor((now - updatedMs) / 1000)) : 0;
+      var ttlRaw = Math.round(Number(board.ttl_sec || 0));
+      var ttlSec = isFinite(ttlRaw) ? Math.max(0, ttlRaw) : 0;
+      var hint = String(board.status_hint || '');
+      var state;
+      var label;
+      if (hint === 'complete') {
+        state = 'complete';
+        label = 'DONE';
+      } else if (hint === 'err') {
+        state = 'err';
+        label = 'ALERT';
+      } else if (ttlSec > 0) {
+        if (ageSec <= ttlSec) {
+          state = 'live';
+          label = 'LIVE';
+        } else if (ageSec <= ttlSec * 2) {
+          state = 'stale';
+          label = 'STALE';
+        } else {
+          state = 'dead';
+          label = 'OFFLINE';
+        }
+      } else if (hint === 'warn') {
+        state = 'stale';
+        label = 'WARN';
+      } else {
+        state = 'static';
+        label = 'BOARD';
+      }
+      return {
+        state: state,
+        label: label,
+        ageSec: ageSec,
+        ttlSec: ttlSec,
+        overdueSec: ttlSec > 0 ? Math.max(0, ageSec - ttlSec) : 0
+      };
+    }
+
+    function formatAgeShort(ageSec) {
+      var s = Math.max(0, Math.floor(Number(ageSec) || 0));
+      if (s < 5) return '刚刚';
+      if (s < 60) return s + 's前';
+      if (s < 3600) return Math.floor(s / 60) + 'm前';
+      return Math.floor(s / 3600) + 'h' + Math.floor((s % 3600) / 60) + 'm前';
+    }
+
+    function newestAnchor(group) {
+      var rows = (group.boards || []).concat(group.sessions || []);
+      if (!rows.length) return null;
+      var best = rows[0];
+      for (var i = 1; i < rows.length; i++) {
+        if (compareSessionsFixed(rows[i], best) < 0) best = rows[i];
+      }
+      return best;
+    }
+
     function buildRailTree(sessions, opts) {
       opts = opts || {};
       var filter = opts.filter || 'all';
       var unreadCountOf = opts.unreadCountOf || function () { return 0; };
+      var nowMs = opts.nowMs;
 
       var filtered = (sessions || []).slice().filter(function (s) {
         if (!s) return false;
@@ -3180,11 +3304,24 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
         return true;
       });
 
+      /* 省略 opts.boards 时行为与 v6 完全一致；面板只是叠加进来的第二类节点。 */
+      var boardRows = (opts.boards || []).filter(function (b) {
+        if (!b || !b.id) return false;
+        if (filter === 'pinned') return !!b.pinned;
+        if (filter === 'unread') {
+          var state = computeBoardHealth(b, nowMs).state;
+          return state === 'stale' || state === 'dead' || state === 'err';
+        }
+        return true;
+      });
+      boardRows.sort(compareSessionsFixed);
+
       var pinnedSessions = filtered.filter(function (s) { return !!s.pinned; });
       pinnedSessions.sort(compareSessionsFixed);
+      var pinnedBoards = boardRows.filter(function (b) { return !!b.pinned; });
 
       var pinnedGroup = null;
-      if (pinnedSessions.length) {
+      if (pinnedSessions.length || pinnedBoards.length) {
         var pinnedUnread = 0;
         pinnedSessions.forEach(function (s) { pinnedUnread += unreadCountOf(s); });
         pinnedGroup = {
@@ -3192,6 +3329,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
           key: '__pinned__',
           label: '置顶',
           sessions: pinnedSessions,
+          boards: pinnedBoards,
           unreadTotal: pinnedUnread
         };
       }
@@ -3203,9 +3341,21 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
         if (!groups[key]) groups[key] = [];
         groups[key].push(s);
       });
+      var boardGroups = {};
+      boardRows.forEach(function (b) {
+        if (b.pinned) return;
+        var key = projectKeyOf(b);
+        if (!boardGroups[key]) boardGroups[key] = [];
+        boardGroups[key].push(b);
+      });
 
-      var projects = Object.keys(groups).map(function (key) {
-        var rows = groups[key].slice().sort(compareSessionsFixed);
+      var keys = {};
+      Object.keys(groups).forEach(function (key) { keys[key] = true; });
+      Object.keys(boardGroups).forEach(function (key) { keys[key] = true; });
+
+      var projects = Object.keys(keys).map(function (key) {
+        var rows = (groups[key] || []).slice().sort(compareSessionsFixed);
+        var groupBoards = (boardGroups[key] || []).slice().sort(compareSessionsFixed);
         var newestCreatedMs = 0;
         var newestCreatedSeq = 0;
         var unreadTotal = 0;
@@ -3214,11 +3364,16 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
           newestCreatedSeq = Math.max(newestCreatedSeq, Number(s.created_seq || 0));
           unreadTotal += unreadCountOf(s);
         });
+        groupBoards.forEach(function (b) {
+          newestCreatedMs = Math.max(newestCreatedMs, parseCreatedMs(b));
+          newestCreatedSeq = Math.max(newestCreatedSeq, Number(b.created_seq || 0));
+        });
         return {
           kind: 'project',
           key: key,
           label: key,
           sessions: rows,
+          boards: groupBoards,
           newestCreatedMs: newestCreatedMs,
           newestCreatedSeq: newestCreatedSeq,
           unreadTotal: unreadTotal
@@ -3226,11 +3381,15 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       });
 
       projects.sort(function (a, b) {
-        return compareSessionsFixed(a.sessions[0], b.sessions[0]) ||
+        return compareSessionsFixed(newestAnchor(a), newestAnchor(b)) ||
           a.key.localeCompare(b.key);
       });
 
-      return { pinned: pinnedGroup, projects: projects, totalCount: filtered.length };
+      return {
+        pinned: pinnedGroup,
+        projects: projects,
+        totalCount: filtered.length + boardRows.length
+      };
     }
 
     return {
@@ -3238,7 +3397,9 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       compareSessionsFixed: compareSessionsFixed,
       stripProjectPrefix: stripProjectPrefix,
       buildRailTree: buildRailTree,
-      sortRepliesDesc: sortRepliesDesc
+      sortRepliesDesc: sortRepliesDesc,
+      computeBoardHealth: computeBoardHealth,
+      formatAgeShort: formatAgeShort
     };
   })();
   (typeof globalThis !== 'undefined' ? globalThis : this).RailTreeCore = RailTreeCore;
@@ -3483,6 +3644,12 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     if (classes.length || cell.note) {
       inner = '<span class="' + classes.join(' ') + '"' +
         (cell.note ? ' title="' + escapeAttr(cell.note) + '"' : '') + '>' + inner + '</span>';
+    }
+    if ((col.bar || cell.bar) && cell.num !== null) {
+      var maxVal = TableCore.finite(cell.max) || TableCore.finite(col.max) || 100;
+      var pct = Math.max(0, Math.min(100, (cell.num / (maxVal > 0 ? maxVal : 100)) * 100));
+      inner += '<div class="tbl-meter"><i style="width:' + pct.toFixed(1) + '%"></i></div>';
+      if (cell.sub) inner += '<div class="tbl-sub">' + escapeHtml(cell.sub) + '</div>';
     }
     if (state.showDelta && baseRow && row.id !== state.baselineId && cell.num !== null) {
       var baseCell = TableCore.getCell(baseRow, col.key);
@@ -4168,13 +4335,33 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 
   /* ---------- 文档装载 ---------- */
 
+  function boardStatusPillHtml(doc) {
+    var health = RailTreeCore.computeBoardHealth(doc, Date.now());
+    var count = Number(doc.update_count) || 0;
+    var epoch = Number(doc.updated_epoch) || 0;
+    var meta = '#' + count + ' · ' + RailTreeCore.formatAgeShort(health.ageSec);
+    if (health.ttlSec > 0) meta += ' · TTL ' + health.ttlSec + 's';
+    return '<span class="board-status-pill" data-health="' + health.state +
+      '" data-epoch="' + epoch + '" data-updated="' + escapeAttr(doc.updated_at || '') +
+      '" data-ttl="' + health.ttlSec +
+      '" data-hint="' + escapeAttr(doc.status_hint || '') + '" data-count="' + count + '">' +
+      health.label + '</span>' +
+      '<span class="board-status-meta">' + escapeHtml(meta) + '</span>';
+  }
+
   function setPaneHeader(pane, doc, hasContent) {
     var title = doc.title || '未命名回复';
+    pane.docTitle.textContent = title;
+    if (doc.kind === 'board') {
+      pane.docSub.innerHTML = boardStatusPillHtml(doc) +
+        ' · ' + escapeHtml(String(doc.format || 'md').toUpperCase());
+      if (pane.name === 'primary') updateDocumentTitle();
+      return;
+    }
     var sub = doc.updated_at ? '更新于 ' + fmtTime(doc.updated_at) : '等待发布';
     if (doc.session_label) sub = doc.session_label + ' · ' + sub;
     if (doc.kind === 'history') sub = '历史记录 · ' + String(doc.format || 'md').toUpperCase() + ' · ' + fmtTime(doc.updated_at);
     if (hasContent) sub += ' · ' + String(doc.content || '').length + ' 字符 · ' + String(doc.format || 'md').toUpperCase();
-    pane.docTitle.textContent = title;
     pane.docSub.textContent = sub;
     if (pane.name === 'primary') updateDocumentTitle();
   }
@@ -4193,10 +4380,19 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     v.drawerSeq = 0;
     v.seq = Number(doc.seq) || 0;
     v.mtime = doc.mtime || 0;
-    v.sessionId = doc.session_id || pane.sessionId || '';
-    v.replyId = doc.reply_id || '';
-    if (v.sessionId) pane.sessionId = v.sessionId;
-    pane.replyId = v.replyId;
+    if (doc.kind === 'board') {
+      v.sessionId = '';
+      v.replyId = '';
+      pane.sessionId = '';
+      pane.replyId = '';
+      pane.boardId = doc.board_id || '';
+    } else {
+      v.sessionId = doc.session_id || pane.sessionId || '';
+      v.replyId = doc.reply_id || '';
+      if (v.sessionId) pane.sessionId = v.sessionId;
+      pane.replyId = v.replyId;
+      pane.boardId = '';
+    }
     pane.viewingHistory = !!opts.history;
 
     var hasContent = !!(v.content && v.content.trim());
@@ -4219,7 +4415,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       }
     }
 
-    setMode(pane, mode);
+    setMode(pane, mode, opts);
     setPaneHeader(pane, doc, hasContent);
 
     if (mode === 'md') {
@@ -4232,7 +4428,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
         pane.content.innerHTML = '';
       }
     }
-    applySubview(pane);
+    applySubview(pane, opts);
   }
   /* ---------- 会话栏 / 未读 ---------- */
 
@@ -4334,7 +4530,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 
     var count = document.createElement('span');
     count.className = 'rail-group-count';
-    count.textContent = String(group.sessions.length);
+    count.textContent = String(group.sessions.length + ((group.boards || []).length));
     head.appendChild(count);
 
     if (group.unreadTotal > 0) {
@@ -4570,6 +4766,86 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     return node;
   }
 
+  /* 实时面板卡片：健康点 + 📊 + 标题 + #更新次数 · 新鲜度 + 健康标签 */
+  function railBoardCard(board, opts) {
+    opts = opts || {};
+    var health = RailTreeCore.computeBoardHealth(board, Date.now());
+    var card = document.createElement('div');
+    card.className = 'rail-board';
+    card.dataset.boardId = board.id;
+    card.dataset.epoch = String(Number(board.updated_epoch) || 0);
+    card.dataset.updated = String(board.updated_at || '');
+    card.dataset.ttl = String(Number(board.ttl_sec) || 0);
+    card.dataset.hint = String(board.status_hint || '');
+    card.dataset.count = String(Number(board.update_count) || 0);
+    card.dataset.active = String(panes.primary.boardId === board.id);
+    card.setAttribute('role', 'treeitem');
+    card.tabIndex = 0;
+
+    var dot = document.createElement('span');
+    dot.className = 'rail-board-dot';
+    dot.dataset.health = health.state;
+    dot.title = health.label;
+    card.appendChild(dot);
+
+    var icon = document.createElement('span');
+    icon.className = 'rail-board-icon';
+    icon.textContent = '📊';
+    card.appendChild(icon);
+
+    var main = document.createElement('div');
+    main.className = 'rail-board-main';
+    var line = document.createElement('div');
+    line.className = 'rail-board-line';
+    var title = document.createElement('span');
+    title.className = 'rail-board-title';
+    title.textContent = opts.inPinned
+      ? (board.label || board.id)
+      : RailTreeCore.stripProjectPrefix(board);
+    line.appendChild(title);
+    var pill = document.createElement('span');
+    pill.className = 'rail-board-pill';
+    pill.dataset.health = health.state;
+    pill.textContent = health.label;
+    line.appendChild(pill);
+    main.appendChild(line);
+    var meta = document.createElement('div');
+    meta.className = 'rail-board-meta';
+    meta.textContent = '#' + (Number(board.update_count) || 0) + ' · ' +
+      RailTreeCore.formatAgeShort(health.ageSec);
+    main.appendChild(meta);
+    card.appendChild(main);
+
+    var actions = document.createElement('div');
+    actions.className = 'rail-actions';
+    actions.appendChild(railButton(board.pinned ? '★' : '☆', board.pinned ? '取消置顶' : '置顶', function (ev) {
+      ev.stopPropagation();
+      toggleBoardPin(board);
+    }));
+    actions.appendChild(railButton('改', '重命名面板', function (ev) {
+      ev.stopPropagation();
+      renameBoard(board);
+    }));
+    actions.appendChild(railButton('◫', '在分屏中打开', function (ev) {
+      ev.stopPropagation();
+      openSplit('board:' + board.id);
+    }));
+    card.appendChild(actions);
+
+    function openBoard(ev) {
+      if (ev) ev.stopPropagation();
+      focusBoard(board.id);
+    }
+    card.addEventListener('click', openBoard);
+    card.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        openBoard(ev);
+      }
+    });
+    return card;
+  }
+
   function railGroup(group, pinned) {
     var wrap = document.createElement('section');
     wrap.className = 'rail-group' + (pinned ? ' rail-group-pinned' : '');
@@ -4580,6 +4856,9 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       var body = document.createElement('div');
       body.className = 'rail-group-body';
       body.setAttribute('role', 'group');
+      (group.boards || []).forEach(function (board) {
+        body.appendChild(railBoardCard(board, { inPinned: pinned }));
+      });
       group.sessions.forEach(function (session) {
         body.appendChild(sessionTreeNode(session, { inPinned: pinned }));
       });
@@ -4603,7 +4882,8 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     list.innerHTML = '';
     var tree = RailTreeCore.buildRailTree(app.sessions, {
       filter: app.filter,
-      unreadCountOf: unreadCount
+      unreadCountOf: unreadCount,
+      boards: app.boards
     });
 
     if (!tree.totalCount) {
@@ -4682,6 +4962,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   function refreshSessions() {
     return fetchJSON('/api/sessions').then(function (data) {
       app.sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      app.boards = Array.isArray(data.boards) ? data.boards : [];
       var seq = Number(data.seq || 0);
       if (seq > app.globalSeq) app.globalSeq = seq;
       app.latestSessionId = data.latest_session_id || app.latestSessionId;
@@ -4748,7 +5029,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
             $('#new-reply-banner').hidden = true;
             app.pendingBanner = null;
           }
-          if (!opts.noUrl) writeUrl({ session: sessionId, reply: doc.reply_id });
+          if (!opts.noUrl) writeUrl({ session: sessionId, reply: doc.reply_id, board: null });
           $('#back-btn').hidden = isLatest;
           refreshHistory();
         } else {
@@ -4768,6 +5049,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   function loadGlobalLatest(pane) {
     return fetchJSON('/api/latest?_=' + Date.now()).then(function (data) {
       pane.sessionId = data.session_id || '';
+      pane.boardId = '';
       pane.replyId = data.reply_id || '';
       pane.viewingHistory = false;
       renderIntoPane(pane, data, { history: false });
@@ -4801,6 +5083,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     return fetchJSON('/api/history/' + encodeURIComponent(filename)).then(function (data) {
       var pane = panes.primary;
       pane.sessionId = data.session_id || '';
+      pane.boardId = '';
       pane.replyId = data.reply_id || '';
       pane.viewingHistory = true;
       renderIntoPane(pane, {
@@ -4904,6 +5187,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     }
     var pane = panes.primary;
     pane.sessionId = sessionId;
+    pane.boardId = '';
     pane.viewingHistory = false;
     app.pendingBanner = null;
     $('#new-reply-banner').hidden = true;
@@ -4915,7 +5199,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     if (target) delete app.collapsedGroups[railGroupKey(target)];
     saveRailState();
     renderRail();
-    if (!opts.silent) writeUrl({ session: sessionId, reply: opts.reply || null, mode: 'lock' });
+    if (!opts.silent) writeUrl({ session: sessionId, reply: opts.reply || null, mode: 'lock', board: null });
     return loadSessionReplies(sessionId, true).then(function (rows) {
       renderRail();
       var replyId = opts.reply || (rows[0] && rows[0].reply_id);
@@ -4929,23 +5213,280 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     });
   }
 
+  /* ---------- 实时面板（Live Board） ---------- */
+
+  function sortedNumericIds(ids) {
+    return ids.sort(function (a, b) {
+      return (parseInt(String(a).slice(1), 10) || 0) - (parseInt(String(b).slice(1), 10) || 0);
+    });
+  }
+
+  /* 原地刷新前的快照：滚动、表格排序/搜索/基准、图表隐藏系列、拓扑缩放。 */
+  function snapshotPaneView(pane) {
+    var snap = {
+      scrollTop: pane.content ? pane.content.scrollTop : 0,
+      canvasScrollTop: pane.canvasPane ? pane.canvasPane.scrollTop : 0,
+      tables: [],
+      charts: [],
+      graphs: []
+    };
+    sortedNumericIds(Object.keys(pane.viewer.tables || {})).forEach(function (id) {
+      var state = pane.viewer.tables[id];
+      snap.tables.push({
+        sig: (state.columns || []).map(function (c) { return String(c.key); }).join('|'),
+        sortKey: state.sortKey || '',
+        sortDir: state.sortDir || 'desc',
+        query: state.query || '',
+        baselineId: state.baselineId || '',
+        showDelta: !!state.showDelta
+      });
+    });
+    sortedNumericIds(Object.keys(pane.viewer.charts || {})).forEach(function (id) {
+      var hidden = {};
+      var prev = pane.viewer.charts[id].hidden || {};
+      Object.keys(prev).forEach(function (key) { hidden[key] = true; });
+      snap.charts.push({ hidden: hidden });
+    });
+    $$('.graph-wrap', pane.canvasRoot).forEach(function (wrap) {
+      snap.graphs.push({
+        scale: parseFloat(wrap.dataset.scale) || 1,
+        mode: wrap.dataset.mode || ''
+      });
+    });
+    return snap;
+  }
+
+  function restorePaneView(pane, snap) {
+    if (!snap) return;
+    var used = {};
+    sortedNumericIds(Object.keys(pane.viewer.tables || {})).forEach(function (id, index) {
+      var state = pane.viewer.tables[id];
+      if (!state) return;
+      var sig = (state.columns || []).map(function (c) { return String(c.key); }).join('|');
+      var saved = null;
+      for (var i = 0; i < snap.tables.length; i++) {
+        if (!used[i] && snap.tables[i].sig === sig) { saved = snap.tables[i]; used[i] = true; break; }
+      }
+      if (!saved && snap.tables[index] && !used[index]) {
+        saved = snap.tables[index];
+        used[index] = true;
+      }
+      if (!saved) return;
+      state.sortKey = saved.sortKey;
+      state.sortDir = saved.sortDir;
+      state.query = saved.query;
+      state.baselineId = saved.baselineId;
+      state.showDelta = saved.showDelta;
+      var card = $('.tbl-card[data-tbl-id="' + id + '"]', pane.canvasRoot);
+      if (!card) return;
+      var search = $('.tbl-search', card);
+      if (search) search.value = state.query;
+      $$('th[data-tcol]', card).forEach(function (th) {
+        var active = th.getAttribute('data-tcol') === state.sortKey;
+        th.classList.toggle('sorted', active);
+        var mark = $('.tbl-sort', th);
+        if (mark) mark.textContent = active ? (state.sortDir === 'asc' ? '↑' : '↓') : '';
+      });
+      var btn = $('[data-tact="delta"]', card);
+      if (btn) btn.setAttribute('aria-pressed', state.showDelta ? 'true' : 'false');
+      var tbody = $('tbody', card);
+      if (tbody) tbody.innerHTML = tableBodyHtml(state);
+    });
+    sortedNumericIds(Object.keys(pane.viewer.charts || {})).forEach(function (id, index) {
+      var state = pane.viewer.charts[id];
+      var saved = snap.charts[index];
+      if (!state || !saved) return;
+      state.hidden = {};
+      Object.keys(saved.hidden || {}).forEach(function (key) { state.hidden[key] = true; });
+      var card = $('.chart-card[data-chart-id="' + id + '"]', pane.canvasRoot);
+      if (card) paintChart(pane, card);
+    });
+    $$('.graph-wrap', pane.canvasRoot).forEach(function (wrap, index) {
+      var saved = snap.graphs[index];
+      if (!saved) return;
+      if (saved.mode) wrap.dataset.mode = saved.mode;
+      applyGraphScale(wrap, saved.scale);
+    });
+    if (pane.content) pane.content.scrollTop = snap.scrollTop;
+    if (pane.canvasPane) pane.canvasPane.scrollTop = snap.canvasScrollTop;
+  }
+
+  function findBoard(boardId) {
+    for (var i = 0; i < app.boards.length; i++) {
+      if (app.boards[i].id === boardId) return app.boards[i];
+    }
+    return null;
+  }
+
+  function loadBoard(pane, boardId, opts) {
+    opts = opts || {};
+    if (!boardId) return Promise.resolve(null);
+    return fetchJSON('/api/boards/' + encodeURIComponent(boardId)).then(function (data) {
+      var board = data.board || {};
+      var doc = {
+        kind: 'board',
+        board_id: board.id || boardId,
+        format: board.format || 'md',
+        title: board.title || board.label || board.id || boardId,
+        content: data.content || '',
+        updated_at: board.updated_at || '',
+        updated_epoch: Number(board.updated_epoch) || 0,
+        ttl_sec: Number(board.ttl_sec) || 0,
+        status_hint: board.status_hint || '',
+        update_count: Number(board.update_count) || 0,
+        seq: Number(board.seq) || 0,
+        mtime: Date.now()
+      };
+      var snapshot = opts.inPlace ? snapshotPaneView(pane) : null;
+      renderIntoPane(pane, doc, { keepDrawer: !!opts.inPlace });
+      if (snapshot) restorePaneView(pane, snapshot);
+      if (pane.name === 'primary') {
+        app.pendingBanner = null;
+        $('#new-reply-banner').hidden = true;
+        $('#back-btn').hidden = true;
+        if (!opts.noUrl) writeUrl({ board: doc.board_id, session: null, reply: null, mode: 'lock' });
+      } else {
+        renderSplitReplies();
+      }
+      if (!opts.silent) setStatus('online', '已同步 ' + clock());
+      renderRail();
+      return data;
+    }).catch(function (err) {
+      if (!opts.inPlace) toast('面板加载失败：' + err.message);
+      return null;
+    });
+  }
+
+  function focusBoard(boardId, opts) {
+    opts = opts || {};
+    if (!boardId) return Promise.resolve(null);
+    if (!opts.keepMode) {
+      app.mode = 'lock';
+      updateModeButton();
+    }
+    return loadBoard(panes.primary, boardId, { noUrl: !!opts.silent });
+  }
+
+  function toggleBoardPin(board) {
+    return postJSON('/api/boards/' + encodeURIComponent(board.id), { pinned: !board.pinned })
+      .then(function () { return refreshSessions(); })
+      .catch(function (err) { toast('置顶失败：' + err.message); });
+  }
+
+  function renameBoard(board) {
+    var name = window.prompt('面板显示名', board.label || '');
+    if (name === null) return;
+    name = String(name).trim();
+    if (!name) return;
+    postJSON('/api/boards/' + encodeURIComponent(board.id), { label: name })
+      .then(function () { return refreshSessions(); })
+      .catch(function (err) { toast('重命名失败：' + err.message); });
+  }
+
+  /* 本地 5s 时钟：只改 DOM 上的健康标签，绝不轮询服务器。 */
+  function boardFromData(el) {
+    return {
+      updated_epoch: Number(el.getAttribute('data-epoch')) || 0,
+      updated_at: el.getAttribute('data-updated') || '',
+      ttl_sec: Number(el.getAttribute('data-ttl')) || 0,
+      status_hint: el.getAttribute('data-hint') || '',
+      update_count: Number(el.getAttribute('data-count')) || 0
+    };
+  }
+
+  function refreshBoardClocks() {
+    var nowMs = Date.now();
+    $$('.rail-board').forEach(function (card) {
+      var board = boardFromData(card);
+      var health = RailTreeCore.computeBoardHealth(board, nowMs);
+      var dot = $('.rail-board-dot', card);
+      if (dot) {
+        dot.dataset.health = health.state;
+        dot.title = health.label;
+      }
+      var pill = $('.rail-board-pill', card);
+      if (pill) {
+        pill.dataset.health = health.state;
+        pill.textContent = health.label;
+      }
+      var meta = $('.rail-board-meta', card);
+      if (meta) {
+        meta.textContent = '#' + (board.update_count || 0) + ' · ' +
+          RailTreeCore.formatAgeShort(health.ageSec);
+      }
+    });
+    [panes.primary.docSub, panes.secondary.docSub].forEach(function (host) {
+      if (!host) return;
+      var pill = $('.board-status-pill', host);
+      if (!pill) return;
+      var board = boardFromData(pill);
+      var health = RailTreeCore.computeBoardHealth(board, nowMs);
+      pill.dataset.health = health.state;
+      pill.textContent = health.label;
+      var meta = $('.board-status-meta', host);
+      if (meta) {
+        var text = '#' + (board.update_count || 0) + ' · ' +
+          RailTreeCore.formatAgeShort(health.ageSec);
+        if (health.ttlSec > 0) text += ' · TTL ' + health.ttlSec + 's';
+        meta.textContent = text;
+      }
+    });
+  }
+
+  function handleBoardEvent(ev) {
+    if (!ev || typeof ev !== 'object') return;
+    var seq = Number(ev.seq || 0);
+    // 与回复事件共用去重游标：SSE 与轮询重复送达时只处理一次
+    if (seq && seq <= app.lastHandledSeq) return;
+    if (seq) app.lastHandledSeq = seq;
+    if (seq > app.globalSeq) app.globalSeq = seq;
+    var boardId = ev.board_id || '';
+    if (!boardId) return;
+    if (panes.primary.boardId === boardId) {
+      loadBoard(panes.primary, boardId, { inPlace: true, noUrl: true, silent: true });
+    }
+    if (splitVisible() && panes.secondary.boardId === boardId) {
+      loadBoard(panes.secondary, boardId, { inPlace: true, noUrl: true, silent: true });
+    }
+    refreshSessions();
+  }
+
   function renderSplitSelect() {
     var sel = $('.sec-session-select');
     if (!sel) return;
-    var current = panes.secondary.sessionId;
+    var current = panes.secondary.boardId
+      ? 'board:' + panes.secondary.boardId
+      : panes.secondary.sessionId;
     sel.innerHTML = '';
     sel.appendChild(new Option('选择分屏会话', ''));
     app.sessions.forEach(function (s) {
       if (s.id === panes.primary.sessionId) return;
       sel.appendChild(new Option(s.label, s.id));
     });
-    var exists = app.sessions.some(function (s) { return s.id === current; });
+    if (app.boards.length) {
+      var optgroup = document.createElement('optgroup');
+      optgroup.label = '实时面板';
+      app.boards.forEach(function (b) {
+        if (b.id === panes.primary.boardId) return;
+        optgroup.appendChild(new Option(
+          (b.label || b.id) + ' · #' + (Number(b.update_count) || 0),
+          'board:' + b.id));
+      });
+      if (optgroup.children.length) sel.appendChild(optgroup);
+    }
+    var exists = Array.prototype.some.call(sel.options, function (o) { return o.value === current; });
     sel.value = exists ? current : '';
   }
 
   function renderSplitReplies() {
     var sel = $('.sec-reply-select');
     if (!sel) return;
+    if (panes.secondary.boardId) {
+      sel.innerHTML = '<option value="">面板视图</option>';
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
     var rows = app.replies[panes.secondary.sessionId] || [];
     var previous = sel.value;
     sel.innerHTML = '';
@@ -4964,24 +5505,39 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     return !$('#pane-secondary').hidden;
   }
 
-  function openSplit(sessionId, opts) {
+  function openSplit(target, opts) {
     opts = opts || {};
-    if (!sessionId) return Promise.resolve(null);
-    if (sessionId === panes.primary.sessionId) {
+    if (!target) return Promise.resolve(null);
+    var isBoard = String(target).indexOf('board:') === 0;
+    var boardId = isBoard ? String(target).slice(6) : '';
+    if (isBoard) {
+      if (!boardId) return Promise.resolve(null);
+      if (boardId === panes.primary.boardId) {
+        if (!opts.silent) toast('请选择另一个面板来分屏');
+        return Promise.resolve(null);
+      }
+    } else if (target === panes.primary.sessionId) {
       if (!opts.silent) toast('请选择另一个会话来分屏');
       return Promise.resolve(null);
     }
     var pane = panes.secondary;
     $('#pane-secondary').hidden = false;
     $('#stage').dataset.split = app.layout || 'h';
-    pane.sessionId = sessionId;
-    if (!opts.silent) writeUrl({ split: sessionId, layout: app.layout || 'h' });
+    pane.sessionId = isBoard ? '' : target;
+    pane.boardId = '';
+    if (!opts.silent) writeUrl({ split: target, layout: app.layout || 'h' });
     renderSplitSelect();
     refitPanes();
-    return loadSessionReplies(sessionId, true).then(function (rows) {
+    if (isBoard) {
+      return loadBoard(pane, boardId, { noUrl: true }).then(function () {
+        renderRail();
+        return null;
+      });
+    }
+    return loadSessionReplies(target, true).then(function (rows) {
       renderRail();
       renderSplitReplies();
-      if (rows[0]) return loadReply(pane, sessionId, rows[0].reply_id, { noUrl: true });
+      if (rows[0]) return loadReply(pane, target, rows[0].reply_id, { noUrl: true });
       renderEmptyPane(pane, '这个会话还没有回复。');
       return null;
     });
@@ -4993,6 +5549,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     $('#stage').dataset.split = '';
     pane.sessionId = '';
     pane.replyId = '';
+    pane.boardId = '';
     pane.viewer.content = '';
     pane.viewer.canvasData = null;
     pane.viewer.drawer = {};
@@ -5001,7 +5558,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       pane.viewer.mm = null;
     }
     var sel = $('.sec-reply-select');
-    if (sel) sel.innerHTML = '<option value="">最新</option>';
+    if (sel) { sel.disabled = false; sel.innerHTML = '<option value="">最新</option>'; }
     writeUrl({ split: null, layout: null });
     renderRail();
     refitPanes();
@@ -5028,6 +5585,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   function readUrl() {
     var params = new URLSearchParams(window.location.search);
     return {
+      board: params.get('board') || '',
       session: params.get('session') || '',
       reply: params.get('reply') || '',
       split: params.get('split') || '',
@@ -5056,11 +5614,13 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
   function applyUrl() {
     var url = readUrl();
     if (url.mode === 'lock' || url.mode === 'global') app.mode = url.mode;
-    else if (url.session) app.mode = 'lock';
+    else if (url.session || url.board) app.mode = 'lock';
     app.layout = url.layout === 'v' ? 'v' : 'h';
     updateModeButton();
     var job;
-    if (url.session) {
+    if (url.board) {
+      job = focusBoard(url.board, { silent: true });
+    } else if (url.session) {
       job = focusSession(url.session, {
         reply: url.reply,
         silent: true,
@@ -5127,7 +5687,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       }
       markSeen(sessionId, seq);
       loadReply(primary, sessionId, ev.reply_id, { noUrl: true }).then(function () {
-        writeUrl({ session: sessionId, reply: ev.reply_id });
+        writeUrl({ session: sessionId, reply: ev.reply_id, board: null });
       });
       refreshSessions();
       return;
@@ -5143,7 +5703,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
 
     if (app.mode === 'global') {
       loadReply(primary, sessionId, ev.reply_id, { noUrl: true }).then(function () {
-        writeUrl({ session: sessionId, reply: ev.reply_id, mode: 'global' });
+        writeUrl({ session: sessionId, reply: ev.reply_id, mode: 'global', board: null });
       });
       refreshSessions();
       return;
@@ -5161,7 +5721,10 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     app.polling = true;
     return fetchJSON('/api/state?since=' + app.globalSeq + '&_=' + Date.now()).then(function (data) {
       setStatus('online', '已同步 ' + clock());
-      (data.events || []).forEach(handleEvent);
+      (data.events || []).forEach(function (ev) {
+        if (ev && ev.event_type === 'board') handleBoardEvent(ev);
+        else handleEvent(ev);
+      });
       if (typeof data.seq === 'number' && data.seq > app.globalSeq) app.globalSeq = data.seq;
       return refreshSessions();
     }).catch(function () {
@@ -5186,6 +5749,11 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
       var payload = null;
       try { payload = JSON.parse(message.data); } catch (err) { return; }
       handleEvent(payload);
+    });
+    app.sse.addEventListener('board', function (message) {
+      var payload = null;
+      try { payload = JSON.parse(message.data); } catch (err) { return; }
+      handleBoardEvent(payload);
     });
     app.sse.addEventListener('error', function () {
       setStatus('stale', '实时断线，轮询中');
@@ -5287,6 +5855,7 @@ body.drawer-open #stage { margin-right: min(486px, 94vw); transition: margin-rig
     connectEvents();
     poll();
     setInterval(poll, 3000);
+    setInterval(refreshBoardClocks, 5000);
   });
 })();
 </script>
@@ -5316,7 +5885,12 @@ class SSEBroker:
         self._thread.start()
 
     def _watch(self) -> None:
-        """state.json 的 seq 变了就推事件，即使写入方没有调用 /api/notify。"""
+        """state.json 的 seq 变了就推事件，即使写入方没有调用 /api/notify。
+
+        回复事件来自 feed.jsonl，面板事件来自 board_events.jsonl；必须按事件流
+        逐条补播 —— 只看 latest_session_id/latest_reply_id 会把面板的 seq 增长
+        当成“没有新回复”静默吞掉。
+        """
         while not self.stop_event.wait(SSE_POLL):
             try:
                 state = vr_store.read_state(self.cache_dir)
@@ -5325,12 +5899,16 @@ class SSEBroker:
             seq = int(state.get("seq") or 0)
             if seq <= self._sent_seq:
                 continue
-            session_id = state.get("latest_session_id") or ""
-            reply_id = state.get("latest_reply_id") or ""
-            if not session_id or not reply_id:
-                self._sent_seq = seq
+            try:
+                events = vr_store.state_events(self.cache_dir, since=self._sent_seq, limit=200)
+            except OSError:
+                events = []
+            if not events:
+                # seq 涨了但没有可补播的事件（例如仅元数据变更）：先别推进游标，
+                # 给写入方一个 SSE_POLL 周期的机会把事件落盘。
                 continue
-            self.push(vr_store.reply_event(self.cache_dir, session_id, reply_id))
+            for event in events:
+                self.push(event)
 
     def push(self, payload: dict) -> None:
         event = dict(payload)
@@ -5627,6 +6205,7 @@ class Handler(BaseHTTPRequestHandler):
     def _sessions_payload(self) -> dict:
         state = vr_store.read_state(self.cache_dir)
         sessions = vr_store.list_sessions(self.cache_dir)
+        boards = vr_store.list_boards(self.cache_dir)
         legacy = len(self._legacy_only_history_files())
         return {
             "version": VERSION,
@@ -5634,7 +6213,9 @@ class Handler(BaseHTTPRequestHandler):
             "latest_session_id": state["latest_session_id"],
             "latest_reply_id": state["latest_reply_id"],
             "sessions": sessions,
+            "boards": boards,
             "count": len(sessions),
+            "board_count": len(boards),
             "legacy_count": legacy,
         }
 
@@ -5706,9 +6287,10 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if event is None:
                     break
+                event_name = "board" if event.get("event_type") == "board" else "reply"
                 frame = (
                     "id: " + str(int(event.get("seq") or 0)) + "\n"
-                    "event: reply\n"
+                    "event: " + event_name + "\n"
                     "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
                 ).encode("utf-8")
                 self.wfile.write(frame)
@@ -5754,6 +6336,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/sessions":
             self._json(self._sessions_payload())
+            return
+        if path == "/api/boards":
+            boards = vr_store.list_boards(self.cache_dir)
+            state = vr_store.read_state(self.cache_dir)
+            self._json({"version": VERSION, "seq": state["seq"],
+                        "boards": boards, "count": len(boards)})
             return
         if path == "/api/feed":
             try:
@@ -5849,6 +6437,37 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._error(404, "未找到该路径")
             return
+        if path.startswith("/api/boards/"):
+            parts = self._segments(path)
+            if len(parts) != 3 or parts[0] != "api" or parts[1] != "boards":
+                self._error(404, "未找到该路径")
+                return
+            board_id = parts[2]
+            if not vr_store.is_safe_id(board_id):
+                self._error(400, "非法的面板 ID")
+                return
+            data = vr_store.read_board(self.cache_dir, board_id)
+            if data is None:
+                self._error(404, "面板不存在")
+                return
+            self._json({"version": VERSION, "board": data["board"],
+                        "content": data["content"]})
+            return
+        if path.startswith("/artifact/board/"):
+            parts = self._segments(path)
+            if len(parts) != 3 or parts[0] != "artifact" or parts[1] != "board":
+                self._error(404, "HTML Artifact 不存在")
+                return
+            board_id = parts[2]
+            if not vr_store.is_safe_id(board_id):
+                self._error(400, "非法的面板 ID")
+                return
+            data = vr_store.read_board(self.cache_dir, board_id)
+            if data is None or str(data["board"].get("format") or "") != "html":
+                self._error(404, "HTML Artifact 不存在")
+                return
+            self._send(200, data["content"].encode("utf-8"), "text/html; charset=utf-8")
+            return
         if path == "/artifact/latest":
             target = self._artifact_payload(None)
             if target is None:
@@ -5935,6 +6554,37 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(404, "会话不存在")
                 return
             self._json({"ok": True, "version": VERSION, "session": record})
+            return
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "boards":
+            board_id = parts[2]
+            if not vr_store.is_safe_id(board_id):
+                self._error(400, "非法的面板 ID")
+                return
+            label = payload.get("label")
+            pinned = payload.get("pinned")
+            if label is not None and not isinstance(label, str):
+                self._error(400, "label 必须是字符串")
+                return
+            if pinned is not None and not isinstance(pinned, bool):
+                self._error(400, "pinned 必须是布尔值")
+                return
+            if label is None and pinned is None:
+                self._error(400, "没有可更新的字段（label / pinned）")
+                return
+            try:
+                with vr_store.cache_lock(self.cache_dir):
+                    record = vr_store.update_board(self.cache_dir, board_id,
+                                                   label=label, pinned=pinned)
+            except vr_store.LockTimeout:
+                self._error(503, "缓存目录正忙，请稍后重试")
+                return
+            except OSError as exc:
+                self._error(500, f"写入失败: {exc}")
+                return
+            if record is None:
+                self._error(404, "面板不存在")
+                return
+            self._json({"ok": True, "version": VERSION, "board": record})
             return
 
         self._error(404, "未找到该路径")
