@@ -639,6 +639,8 @@ try {
     });
   } else if (data.op === 'age') {
     out.values = (data.ages || []).map(function (a) { return api.formatAgeShort(a); });
+  } else if (data.op === 'shortcut') {
+    out.values = (data.events || []).map(function (ev) { return api.isRailShortcut(ev); });
   } else {
     out.error = 'unknown op';
   }
@@ -2122,7 +2124,8 @@ def main() -> int:
                       'id="new-reply-banner"', 'id="mode-btn"', 'id="rail-toggle"',
                       'id="feed-btn"', 'id="reading-pane"', 'id="content"',
                       'id="canvas-root"', 'id="artifact-frame"', 'id="artifact-source"',
-                      'id="mindmap-pane"', 'id="history-select"', 'id="drawer"'):
+                      'id="mindmap-pane"', 'id="history-select"', 'id="drawer"',
+                      'id="rail-close"'):
             check(f"页面保留/新增 {token}", token in page)
 
         for fn in ("renderIntoPane", "openSplit", "closeSplit", "handleEvent",
@@ -2131,7 +2134,8 @@ def main() -> int:
                    "poll", "refreshLatestNow", "applyUrl", "writeUrl", "readUrl",
                    "totalUnread", "updateDocumentTitle", "refitPanes",
                    "railBoardCard", "loadBoard", "focusBoard", "handleBoardEvent",
-                   "refreshBoardClocks", "snapshotPaneView", "restorePaneView"):
+                   "refreshBoardClocks", "snapshotPaneView", "restorePaneView",
+                   "setRailOpen", "closeRail", "toggleRail"):
             check(f"前端实现 {fn}", f"function {fn}" in page)
 
         for token in ("new EventSource('/api/events')", "URLSearchParams",
@@ -2153,7 +2157,9 @@ def main() -> int:
                       ".rail-board", "rail-board-dot", "board-status-pill",
                       "computeBoardHealth", "formatAgeShort", "tbl-meter", "tbl-sub",
                       "实时面板", "app.sse.addEventListener('board'",
-                      "refreshBoardClocks, 5000", "params.get('board')", "'board:' +"):
+                      "refreshBoardClocks, 5000", "params.get('board')", "'board:' +",
+                      'aria-keyshortcuts="Control+B"', "关闭会话栏",
+                      "rail.inert = !next", "RailTreeCore.isRailShortcut(ev)"):
             check(f"页面包含 {token}", token in page)
 
         check("会话树容器带 role=tree",
@@ -2247,6 +2253,41 @@ def main() -> int:
               (parse_result.get("result") or {}).get("values")
               == [1767225600000, 1767312000000, 0],
               str(parse_result))
+
+        shortcut_accept = [
+            {"key": "b", "code": "KeyB", "ctrlKey": True},
+            {"key": "B", "code": "KeyB", "ctrlKey": True},
+            {"key": "b", "code": "KeyB", "metaKey": True},
+            {"key": "∫", "code": "KeyB", "ctrlKey": True},
+            {"key": "b", "code": "KeyB", "ctrlKey": True,
+             "target": {"tagName": "BUTTON", "type": "button"}},
+        ]
+        shortcut_reject = [
+            {"key": "b", "code": "KeyB", "ctrlKey": True, "shiftKey": True},
+            {"key": "b", "code": "KeyB", "ctrlKey": True, "altKey": True},
+            {"key": "b", "code": "KeyB", "ctrlKey": True, "metaKey": True},
+            {"key": "b", "code": "KeyB"},
+            {"key": "b", "code": "KeyB", "ctrlKey": True, "repeat": True},
+            {"key": "b", "code": "KeyB", "ctrlKey": True, "isComposing": True},
+            {"key": "b", "code": "KeyB", "ctrlKey": True, "keyCode": 229},
+            {"key": "b", "code": "KeyB", "ctrlKey": True,
+             "target": {"tagName": "INPUT", "type": "search"}},
+            {"key": "b", "code": "KeyB", "ctrlKey": True,
+             "target": {"tagName": "TEXTAREA"}},
+            {"key": "b", "code": "KeyB", "ctrlKey": True,
+             "target": {"isContentEditable": True}},
+        ]
+        accept_result = run_rail_core(
+            page, {"op": "shortcut", "events": shortcut_accept}, geo_dir)
+        check("isRailShortcut 接受 Ctrl/Cmd+B 与 IME 字符键",
+              (accept_result.get("result") or {}).get("values")
+              == [True] * len(shortcut_accept), str(accept_result))
+
+        reject_result = run_rail_core(
+            page, {"op": "shortcut", "events": shortcut_reject}, geo_dir)
+        check("isRailShortcut 拒绝多余修饰键、输入框与重复/组字事件",
+              (reject_result.get("result") or {}).get("values")
+              == [False] * len(shortcut_reject), str(reject_result))
 
         unread_result = run_rail_core(page, {
             "op": "build", "sessions": RAIL_SESSIONS,
